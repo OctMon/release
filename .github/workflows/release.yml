@@ -1,0 +1,135 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: '部署环境'
+        required: true
+        type: choice
+        options:
+          - PW
+          - LJ
+          - DNT
+          - LMT
+      bump_build:
+        description: '是否自动增加 build 号'
+        required: true
+        type: boolean
+        default: true
+      upload_testflight:
+        description: '是否上传 TestFlight'
+        required: true
+        type: boolean
+        default: true
+      upload_pgyer:
+        description: '是否上传 Pgyer'
+        required: true
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    name: CI Build
+    runs-on: macos-15
+
+    steps:
+      # 设置 git 地址和 WORKDIR
+      - name: Select Work Directory
+        run: |
+          case "${{ github.event.inputs.environment }}" in
+            PW)  REPO="${{ secrets.PW }}" ;;
+            LJ)  REPO="${{ secrets.LJ }}" ;;
+            DNT) REPO="${{ secrets.DNT }}" ;;
+            LMT) REPO="${{ secrets.LMT }}" ;;
+          esac
+          
+          echo "REPO=$REPO" >> $GITHUB_ENV
+          
+          # 取仓库名 (去掉 .git 后缀)
+          WORKDIR=$(basename -s .git "$REPO")
+          echo "WORKDIR=$WORKDIR" >> $GITHUB_ENV
+
+      - name: Select Xcode version
+        run: "sudo xcode-select --switch /Applications/Xcode_16.3.app/Contents/Developer"
+
+      # 安装必要的依赖
+      - name: Install python and codemagic tools
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.8'
+
+      - name: Install python dependencies
+        run: python -m pip install codemagic-cli-tools
+
+      # 设置SSH KEY
+      - name: Setup SSH
+        run: |
+          mkdir -p "$HOME/.ssh"
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan codeup.aliyun.com >> "$HOME/.ssh/known_hosts"
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      # Clone Repo
+      - name: Clone target repo
+        run: git clone --recursive "$REPO" -b $BRANCH
+        env:
+          BRANCH: ${{ secrets.BRANCH }}
+
+      # 版本号自动+1
+      - name: Bump build number & push
+        if: ${{ github.event.inputs.bump_build == 'true' }}
+        run: |
+          cd $WORKDIR
+          
+          # 读取 pubspec.yaml version
+          VERSION_LINE=$(grep '^version:' pubspec.yaml)
+          
+          # 提取 version 和 build
+          VERSION_NAME=$(echo $VERSION_LINE | cut -d'+' -f1 | awk '{print $2}')
+          BUILD_NUM=$(echo $VERSION_LINE | cut -d'+' -f2)
+          
+          # build +1
+          NEW_BUILD_NUM=$((BUILD_NUM + 1))
+          
+          # 替换 pubspec.yaml
+          sed -i "" "s/^version:.*/version: $VERSION_NAME+$NEW_BUILD_NUM/" pubspec.yaml
+          echo "NEW_BUILD_NUM=$NEW_BUILD_NUM" >> $GITHUB_ENV
+          
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add pubspec.yaml
+          git commit -m "release: $VERSION_LINE+$NEW_BUILD_NUM"
+          git push
+
+      # 安装Flutter
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version-file: ${{ env.WORKDIR }}/pubspec.yaml
+      - run: flutter --version
+
+      # 打包iOS
+      - name: Building IPA
+        if: ${{ github.event.inputs.upload_testflight == 'true' }}
+        run: |
+          cd $WORKDIR/ios
+          fastlane ios release_beta
+        env:
+          PUB_HOSTED_URL: https://pub.flutter-io.cn
+          FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+
+      # 打包android
+      - name: Building APK
+        if: ${{ github.event.inputs.upload_pgyer == 'true' }}
+        run: |
+          cd $WORKDIR/android
+          fastlane android release_beta
+        env:
+          PUB_HOSTED_URL: https://pub.flutter-io.cn
+          FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+          PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
