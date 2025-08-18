@@ -101,7 +101,7 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git add pubspec.yaml
-          git commit -m "release: $VERSION_LINE+$NEW_BUILD_NUM"
+          git commit -m "release: $VERSION_NAME+$NEW_BUILD_NUM"
           git push
 
       # 安装Flutter
