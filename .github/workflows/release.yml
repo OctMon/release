@@ -155,3 +155,10 @@ jobs:
           PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
           PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
+
+      # 飞书机器人通知
+      - name: Notify FeiShu
+        if: always()
+        run: |
+          cd $WORKDIR/fastlane
+          fastlane notify_fei_shu
