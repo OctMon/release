@@ -195,7 +195,7 @@ jobs:
         if: always() && !cancelled()  # 排除取消状态
         run: |
           cd $WORKDIR/fastlane
-          fastlane notify_fei_shu
+          fastlane notify_fei_shu flavor:${{ github.event.inputs.flavor }}
         env:
           JOB_STATUS: ${{ job.status }}
           GITHUB_ACTOR: ${{ github.actor }}
