@@ -155,7 +155,9 @@ jobs:
           fi
 
       - name: Generate launcher icons
-        run: flutter pub run flutter_launcher_icons
+        run: |
+          cd $WORKDIR
+          flutter pub run flutter_launcher_icons
 
       # 打包iOS
       - name: Building IPA
