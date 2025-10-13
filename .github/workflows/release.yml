@@ -12,6 +12,14 @@ on:
           - LJ
           - DNT
           - LMT
+      flavor:
+        description: "构建环境"
+        required: true
+        default: "production"
+        type: choice
+        options:
+          - production
+          - beta
       bump_build:
         description: '是否自动增加 build 号'
         required: true
@@ -134,12 +142,27 @@ jobs:
           flutter-version-file: ${{ env.WORKDIR }}/pubspec.yaml
       - run: flutter --version
 
+      # 动态修改 pubspec.yaml 的 icon 路径
+      - name: Set launcher icon
+        run: |
+          cd $WORKDIR
+          if [ "${{ github.event.inputs.flavor }}" = "beta" ]; then
+            echo "⚙️ 切换为 Beta 图标"
+            yq -i '.flutter_launcher_icons.image_path = "icons/icon_beta.png"' pubspec.yaml
+          else
+            echo "⚙️ 使用正式版图标"
+            yq -i '.flutter_launcher_icons.image_path = "icons/icon.png"' pubspec.yaml
+          fi
+
+      - name: Generate launcher icons
+        run: flutter pub run flutter_launcher_icons
+
       # 打包iOS
       - name: Building IPA
         if: ${{ github.event.inputs.upload_testflight == 'true' }}
         run: |
           cd $WORKDIR/ios
-          fastlane ios release_beta
+          fastlane ios release_beta flavor:${{ github.event.inputs.flavor }}
         env:
           PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
@@ -150,7 +173,7 @@ jobs:
         if: ${{ github.event.inputs.upload_pgyer == 'true' }}
         run: |
           cd $WORKDIR/android
-          fastlane android release_beta
+          fastlane android release_beta flavor:${{ github.event.inputs.flavor }}
         env:
           PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
