@@ -157,7 +157,10 @@ jobs:
       - name: Generate launcher icons
         run: |
           cd $WORKDIR
-          flutter pub run flutter_launcher_icons
+          dart run flutter_launcher_icons
+        env:
+          PUB_HOSTED_URL: https://pub.flutter-io.cn
+          FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
 
       # 打包iOS
       - name: Building IPA
