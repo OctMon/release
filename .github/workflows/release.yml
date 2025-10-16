@@ -12,6 +12,11 @@ on:
           - LJ
           - DNT
           - LMT
+      branch:
+        description: "构建分支"
+        required: true
+        default: "main"
+        type: string
       flavor:
         description: "构建环境"
         required: true
@@ -82,9 +87,7 @@ jobs:
 
       # Clone Repo
       - name: Clone target repo
-        run: git clone --recursive "$REPO" -b $BRANCH
-        env:
-          BRANCH: ${{ secrets.BRANCH }}
+        run: git clone --recursive "$REPO" -b ${{ github.event.inputs.branch }}
 
       # 版本号自动+1
       - name: Bump build number & push
