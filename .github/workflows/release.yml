@@ -66,15 +66,6 @@ jobs:
       - name: Select Xcode version
         run: "sudo xcode-select --switch /Applications/Xcode_16.3.app/Contents/Developer"
 
-      # 安装必要的依赖
-      - name: Install python and codemagic tools
-        uses: actions/setup-python@v2
-        with:
-          python-version: '3.8'
-
-      - name: Install python dependencies
-        run: python -m pip install codemagic-cli-tools
-
       # 设置SSH KEY
       - name: Setup SSH
         run: |
