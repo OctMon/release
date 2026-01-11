@@ -12,6 +12,8 @@ on:
           - LJ
           - DNT
           - LMT
+          - HT
+          - SP
       branch:
         description: "构建分支"
         required: true
@@ -55,6 +57,8 @@ jobs:
             LJ)  REPO="${{ secrets.LJ }}" ;;
             DNT) REPO="${{ secrets.DNT }}" ;;
             LMT) REPO="${{ secrets.LMT }}" ;;
+            HT)  REPO="${{ secrets.HT }}" ;;
+            SP)  REPO="${{ secrets.SP }}" ;;
           esac
           
           echo "REPO=$REPO" >> $GITHUB_ENV
@@ -64,7 +68,7 @@ jobs:
           echo "WORKDIR=$WORKDIR" >> $GITHUB_ENV
 
       - name: Select Xcode version
-        run: "sudo xcode-select --switch /Applications/Xcode_16.3.app/Contents/Developer"
+        run: "sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer"
 
       # 设置SSH KEY
       - name: Setup SSH
