@@ -68,7 +68,7 @@ jobs:
           echo "WORKDIR=$WORKDIR" >> $GITHUB_ENV
 
       - name: Select Xcode version
-        run: "sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer"
+        run: "sudo xcode-select --switch /Applications/Xcode_16.3.app/Contents/Developer"
 
       # 设置SSH KEY
       - name: Setup SSH
