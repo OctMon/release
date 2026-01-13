@@ -33,12 +33,17 @@ on:
         type: boolean
         default: true
       upload_testflight:
-        description: '是否上传 TestFlight'
+        description: '是否打包 iOS 上传到 TestFlight'
         required: true
         type: boolean
         default: true
+      upload_macos_testflight:
+        description: '是否打包 macOS 上传到 TestFlight'
+        required: true
+        type: boolean
+        default: false
       upload_pgyer:
-        description: '是否上传 Pgyer'
+        description: '是否打包 Android'
         required: true
         type: boolean
         default: true
@@ -187,6 +192,17 @@ jobs:
           PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
           PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
+
+      # 打包macOS
+      - name: Building macOS
+        if: ${{ github.event.inputs.upload_macos_testflight == 'true' }}
+        run: |
+          cd $WORKDIR/macos
+          fastlane macos release_beta flavor:${{ github.event.inputs.flavor }}
+        env:
+          PUB_HOSTED_URL: https://pub.flutter-io.cn
+          FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
 
       # 飞书机器人通知
       - name: Notify FeiShu
