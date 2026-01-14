@@ -72,8 +72,14 @@ jobs:
           WORKDIR=$(basename -s .git "$REPO")
           echo "WORKDIR=$WORKDIR" >> $GITHUB_ENV
 
+      - name: List available Xcode versions
+        run: |
+          ls -1 /Applications | grep -E '^Xcode.*\.app$' || true
+
       - name: Select Xcode version
-        run: "sudo xcode-select --switch /Applications/Xcode_16.3.app/Contents/Developer"
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: "16.4"
 
       # 设置SSH KEY
       - name: Setup SSH
