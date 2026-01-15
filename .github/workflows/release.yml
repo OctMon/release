@@ -8,6 +8,7 @@ on:
         required: true
         type: choice
         options:
+          - 请选择
           - PW
           - LJ
           - DNT
@@ -54,6 +55,13 @@ jobs:
     runs-on: macos-15
 
     steps:
+      - name: Validate environment input
+        run: |
+          if [ "${{ github.event.inputs.environment }}" = "请选择" ]; then
+            echo "Please select a valid environment (not 请选择)."
+            exit 1
+          fi
+
       # 设置 git 地址和 WORKDIR
       - name: Select Work Directory
         run: |
