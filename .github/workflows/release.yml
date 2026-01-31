@@ -48,6 +48,11 @@ on:
         required: true
         type: boolean
         default: true
+      is_overseas:
+        description: '是否海外'
+        required: true
+        type: boolean
+        default: false
 
 jobs:
   build:
@@ -158,6 +163,16 @@ jobs:
           channel: stable
           flutter-version-file: ${{ env.WORKDIR }}/pubspec.yaml
       - run: flutter --version
+      
+      - name: Install FlutterFire CLI
+        if: ${{ github.event.inputs.is_overseas == 'true' }}
+        run: |
+          dart pub global activate flutterfire_cli
+          echo "PATH=$HOME/.pub-cache/bin:$PATH" >> $GITHUB_ENV
+      
+      - name: Verify FlutterFire
+        if: ${{ github.event.inputs.is_overseas == 'true' }}
+        run: flutterfire --version
 
       # 动态修改 pubspec.yaml 的 icon 路径
       - name: Set launcher icon
@@ -201,7 +216,7 @@ jobs:
         if: ${{ github.event.inputs.upload_pgyer == 'true' }}
         run: |
           cd $WORKDIR/android
-          fastlane android release_beta flavor:${{ github.event.inputs.flavor }}
+          fastlane android release_beta flavor:${{ github.event.inputs.flavor }} is_overseas:${{ github.event.inputs.is_overseas }}
         env:
           PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
