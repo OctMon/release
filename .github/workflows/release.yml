@@ -222,6 +222,25 @@ jobs:
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
           PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
 
+      - name: Prepare Google Play json
+        if: ${{ github.event.inputs.is_overseas == 'true' }}
+        run: |
+          mkdir -p "$WORKDIR/android/fastlane"
+          cat > "$WORKDIR/android/fastlane/google_play_service_account.json" << 'EOF'
+          ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+          EOF
+          chmod 600 "$WORKDIR/android/fastlane/google_play_service_account.json"
+
+      # 打包aab
+      - name: Building AAB
+        if: ${{ github.event.inputs.is_overseas == 'true' }}
+        run: |
+          cd $WORKDIR/android
+          fastlane android release_aab flavor:${{ github.event.inputs.flavor }} is_overseas:${{ github.event.inputs.is_overseas }} json_key_path:$WORKDIR/android/fastlane/google_play_service_account.json
+        env:
+          PUB_HOSTED_URL: https://pub.flutter-io.cn
+          FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+
       # 打包macOS
       - name: Building macOS
         if: ${{ github.event.inputs.upload_macos_testflight == 'true' }}
