@@ -15,6 +15,7 @@ on:
           - LMT
           - HT
           - SP
+          - CY
       branch:
         description: "构建分支"
         required: true
@@ -77,6 +78,7 @@ jobs:
             LMT) REPO="${{ secrets.LMT }}" ;;
             HT)  REPO="${{ secrets.HT }}" ;;
             SP)  REPO="${{ secrets.SP }}" ;;
+            CY)  REPO="${{ secrets.CY }}" ;;
           esac
           
           echo "REPO=$REPO" >> $GITHUB_ENV
