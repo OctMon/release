@@ -7,28 +7,18 @@ on:
         description: '部署环境'
         required: true
         type: choice
-        options:
-          - 请选择
-          - PW
-          - LJ
-          - DNT
-          - LMT
-          - HT
-          - SP
-          - CY
+        options: [请选择, PW, LJ, DNT, LMT, HT, SP, CY]
       branch:
-        description: "构建分支"
+        description: '构建分支'
         required: true
-        default: "main"
+        default: 'main'
         type: string
       flavor:
-        description: "构建环境"
+        description: '构建环境'
         required: true
-        default: "production"
+        default: 'production'
         type: choice
-        options:
-          - production
-          - beta
+        options: [production, beta]
       bump_build:
         description: '是否自动增加 build 号'
         required: true
@@ -69,128 +59,157 @@ jobs:
   build:
     name: CI Build
     runs-on: macos-15
+    env:
+      RELEASE_TOOLS_DIR: ${{ github.workspace }}/release-tools
+      TARGET_APP_DIR: ${{ github.workspace }}/target-app
+      RELEASE_CONFIG_PATH: ${{ github.workspace }}/target-app/.github/release.yml
+      SELECTED_ENVIRONMENT: ${{ github.event.inputs.environment }}
+      BUILD_BRANCH: ${{ github.event.inputs.branch }}
+      BUILD_FLAVOR: ${{ github.event.inputs.flavor }}
+      EXTERNAL_TESTING: ${{ github.event.inputs.external_testing }}
+      IS_OVERSEAS: ${{ github.event.inputs.is_overseas }}
+      PW_REPO: ${{ secrets.PW }}
+      LJ_REPO: ${{ secrets.LJ }}
+      DNT_REPO: ${{ secrets.DNT }}
+      LMT_REPO: ${{ secrets.LMT }}
+      HT_REPO: ${{ secrets.HT }}
+      SP_REPO: ${{ secrets.SP }}
+      CY_REPO: ${{ secrets.CY }}
 
     steps:
       - name: Validate environment input
         run: |
-          if [ "${{ github.event.inputs.environment }}" = "请选择" ]; then
+          if [ "$SELECTED_ENVIRONMENT" = "请选择" ]; then
             echo "Please select a valid environment (not 请选择)."
             exit 1
           fi
 
-      # 设置 git 地址和 WORKDIR
-      - name: Select Work Directory
+      - name: Select target repository
         run: |
-          case "${{ github.event.inputs.environment }}" in
-            PW)  REPO="${{ secrets.PW }}" ;;
-            LJ)  REPO="${{ secrets.LJ }}" ;;
-            DNT) REPO="${{ secrets.DNT }}" ;;
-            LMT) REPO="${{ secrets.LMT }}" ;;
-            HT)  REPO="${{ secrets.HT }}" ;;
-            SP)  REPO="${{ secrets.SP }}" ;;
-            CY)  REPO="${{ secrets.CY }}" ;;
+          case "$SELECTED_ENVIRONMENT" in
+            PW)  REPO="$PW_REPO" ;;
+            LJ)  REPO="$LJ_REPO" ;;
+            DNT) REPO="$DNT_REPO" ;;
+            LMT) REPO="$LMT_REPO" ;;
+            HT)  REPO="$HT_REPO" ;;
+            SP)  REPO="$SP_REPO" ;;
+            CY)  REPO="$CY_REPO" ;;
           esac
-          
-          echo "REPO=$REPO" >> $GITHUB_ENV
-          
-          # 取仓库名 (去掉 .git 后缀)
-          WORKDIR=$(basename -s .git "$REPO")
-          echo "WORKDIR=$WORKDIR" >> $GITHUB_ENV
+          if [ -z "$REPO" ]; then
+            echo "Repository secret is empty for $SELECTED_ENVIRONMENT"
+            exit 1
+          fi
+          echo "REPO=$REPO" >> "$GITHUB_ENV"
+
+      - name: Checkout centralized release tools
+        uses: actions/checkout@v4
+        with:
+          path: release-tools
 
       - name: List available Xcode versions
-        run: |
-          ls -1 /Applications | grep -E '^Xcode.*\.app$' || true
+        run: ls -1 /Applications | grep -E '^Xcode.*\.app$' || true
 
       - name: Select Xcode version
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: "26.2"
+          xcode-version: '26.2'
 
-      # 设置SSH KEY
+      - name: Set up Ruby and Fastlane
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+          working-directory: release-tools
+
       - name: Setup SSH
         run: |
           mkdir -p "$HOME/.ssh"
-          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          echo "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
           chmod 600 "$HOME/.ssh/id_ed25519"
-          ssh-keyscan codeup.aliyun.com >> "$HOME/.ssh/known_hosts"
+          ssh-keyscan codeup.aliyun.com github.com >> "$HOME/.ssh/known_hosts"
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      # Clone Repo
-      - name: Clone target repo
-        run: git clone --recursive "$REPO" -b ${{ github.event.inputs.branch }}
+      - name: Clone target repository
+        run: git clone --recursive --branch "$BUILD_BRANCH" "$REPO" "$TARGET_APP_DIR"
 
-      # 版本号自动+1
-      - name: Bump build number & push
-        if: ${{ github.event.inputs.bump_build == 'true' }}
+      - name: Detect centralized release configuration
+        id: release_mode
         run: |
-          cd $WORKDIR
-          
-          # 读取 pubspec.yaml version
+          if [ -f "$RELEASE_CONFIG_PATH" ]; then
+            echo "centralized=true" >> "$GITHUB_OUTPUT"
+            echo "Using centralized release lanes"
+          else
+            echo "centralized=false" >> "$GITHUB_OUTPUT"
+            echo "Release configuration not found; using legacy project lanes during migration"
+          fi
+
+      - name: Validate centralized release configuration
+        if: ${{ steps.release_mode.outputs.centralized == 'true' }}
+        working-directory: ${{ env.RELEASE_TOOLS_DIR }}
+        run: |
+          bundle exec fastlane validate_config \
+            project_root:"$TARGET_APP_DIR" \
+            config_path:"$RELEASE_CONFIG_PATH" \
+            external_testing:"$EXTERNAL_TESTING" \
+            changelog:"$TESTFLIGHT_CHANGELOG"
+        env:
+          TESTFLIGHT_CHANGELOG: ${{ github.event.inputs.testflight_changelog }}
+
+      - name: Bump build number and push
+        if: ${{ github.event.inputs.bump_build == 'true' }}
+        working-directory: ${{ env.TARGET_APP_DIR }}
+        run: |
           VERSION_LINE=$(grep '^version:' pubspec.yaml)
           VERSION_NAME=$(echo "$VERSION_LINE" | cut -d'+' -f1 | awk '{print $2}')
           OLD_BUILD=$(echo "$VERSION_LINE" | cut -d'+' -f2)
           OLD_BUILD=${OLD_BUILD:-0}
-
-          # 获取今天日期 (yyyyMMdd)
           TODAY=$(date +%Y%m%d)
-
-          # 提取旧 build 号的日期部分和计数部分
           OLD_DATE=${OLD_BUILD:0:8}
           OLD_COUNT=${OLD_BUILD:8:1}
           OLD_COUNT=${OLD_COUNT:-0}
 
           if [ "$OLD_DATE" = "$TODAY" ]; then
-            # 如果是今天，计数+1
             NEW_COUNT=$((OLD_COUNT + 1))
           else
-            # 如果不是今天，重置为0
             NEW_COUNT=0
           fi
 
           NEW_BUILD_NUM="${TODAY}${NEW_COUNT}"
-
           echo "Current version: $VERSION_NAME+$OLD_BUILD"
           echo "New build number: $NEW_BUILD_NUM"
-          
-          # 替换 pubspec.yaml
-          # 兼容 macOS 和 Linux 的 sed
-          if [ "${{ runner.os }}" = "macOS" ]; then
-            sed -i "" "s/^version:.*/version: $VERSION_NAME+$NEW_BUILD_NUM/" pubspec.yaml
-          else
-            sed -i "s/^version:.*/version: $VERSION_NAME+$NEW_BUILD_NUM/" pubspec.yaml
-          fi
-          echo "NEW_BUILD_NUM=$NEW_BUILD_NUM" >> $GITHUB_ENV
-          
+          sed -i "" "s/^version:.*/version: $VERSION_NAME+$NEW_BUILD_NUM/" pubspec.yaml
+          echo "NEW_BUILD_NUM=$NEW_BUILD_NUM" >> "$GITHUB_ENV"
+
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
           git add pubspec.yaml
           git commit -m "release: $VERSION_NAME+$NEW_BUILD_NUM" || echo "No changes to commit"
           git push
 
-      # 安装Flutter
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: stable
-          flutter-version-file: ${{ env.WORKDIR }}/pubspec.yaml
-      - run: flutter --version
-      
+          flutter-version-file: target-app/pubspec.yaml
+
+      - name: Show Flutter version
+        run: flutter --version
+
       - name: Install FlutterFire CLI
         if: ${{ github.event.inputs.is_overseas == 'true' }}
         run: |
           dart pub global activate flutterfire_cli
-          echo "PATH=$HOME/.pub-cache/bin:$PATH" >> $GITHUB_ENV
-      
+          echo "PATH=$HOME/.pub-cache/bin:$PATH" >> "$GITHUB_ENV"
+
       - name: Verify FlutterFire
         if: ${{ github.event.inputs.is_overseas == 'true' }}
         run: flutterfire --version
 
-      # 动态修改 pubspec.yaml 的 icon 路径
       - name: Set launcher icon
+        working-directory: ${{ env.TARGET_APP_DIR }}
         run: |
-          cd $WORKDIR
-          if [ "${{ github.event.inputs.flavor }}" = "beta" ]; then
+          if [ "$BUILD_FLAVOR" = "beta" ]; then
             echo "⚙️ 切换为 Beta 图标"
             yq -i '
               .flutter_launcher_icons.image_path = "icons/icon_beta.png" |
@@ -205,64 +224,118 @@ jobs:
           fi
 
       - name: Generate launcher icons
-        run: |
-          cd $WORKDIR
-          dart run flutter_launcher_icons
+        working-directory: ${{ env.TARGET_APP_DIR }}
+        run: dart run flutter_launcher_icons
         env:
           PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
 
-      # 打包iOS
-      - name: Building IPA
-        if: ${{ github.event.inputs.upload_testflight == 'true' }}
+      - name: Build IPA and upload TestFlight
+        if: ${{ github.event.inputs.upload_testflight == 'true' && steps.release_mode.outputs.centralized == 'true' }}
+        working-directory: ${{ env.RELEASE_TOOLS_DIR }}
         run: |
-          cd $WORKDIR/ios
-          fastlane ios release_beta flavor:${{ github.event.inputs.flavor }} external_testing:${{ github.event.inputs.external_testing }} changelog:"${TESTFLIGHT_CHANGELOG}"
+          bundle exec fastlane ios release_beta \
+            project_root:"$TARGET_APP_DIR" \
+            config_path:"$RELEASE_CONFIG_PATH" \
+            flavor:"$BUILD_FLAVOR" \
+            external_testing:"$EXTERNAL_TESTING" \
+            changelog:"$TESTFLIGHT_CHANGELOG"
         env:
           PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
           TESTFLIGHT_CHANGELOG: ${{ github.event.inputs.testflight_changelog }}
 
-      # 打包android
-      - name: Building APK
-        if: ${{ github.event.inputs.upload_pgyer == 'true' }}
+      - name: Build IPA with legacy project lane
+        if: ${{ github.event.inputs.upload_testflight == 'true' && steps.release_mode.outputs.centralized != 'true' }}
+        working-directory: ${{ env.TARGET_APP_DIR }}/ios
         run: |
-          cd $WORKDIR/android
-          fastlane android release_beta flavor:${{ github.event.inputs.flavor }} is_overseas:${{ github.event.inputs.is_overseas }}
+          fastlane ios release_beta \
+            flavor:"$BUILD_FLAVOR" \
+            external_testing:"$EXTERNAL_TESTING" \
+            changelog:"$TESTFLIGHT_CHANGELOG"
+        env:
+          PUB_HOSTED_URL: https://pub.flutter-io.cn
+          FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          TESTFLIGHT_CHANGELOG: ${{ github.event.inputs.testflight_changelog }}
+
+      - name: Build APK and upload Pgyer
+        if: ${{ github.event.inputs.upload_pgyer == 'true' && steps.release_mode.outputs.centralized == 'true' }}
+        working-directory: ${{ env.RELEASE_TOOLS_DIR }}
+        run: |
+          bundle exec fastlane android release_beta \
+            project_root:"$TARGET_APP_DIR" \
+            config_path:"$RELEASE_CONFIG_PATH" \
+            flavor:"$BUILD_FLAVOR" \
+            is_overseas:"$IS_OVERSEAS"
         env:
           PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
           PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
 
-      # 打包aab
-      - name: Building AAB
-        if: ${{ github.event.inputs.is_overseas == 'true' }}
+      - name: Build APK with legacy project lane
+        if: ${{ github.event.inputs.upload_pgyer == 'true' && steps.release_mode.outputs.centralized != 'true' }}
+        working-directory: ${{ env.TARGET_APP_DIR }}/android
+        run: fastlane android release_beta flavor:"$BUILD_FLAVOR" is_overseas:"$IS_OVERSEAS"
+        env:
+          PUB_HOSTED_URL: https://pub.flutter-io.cn
+          FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+          PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
+
+      - name: Build AAB and upload Google Play
+        if: ${{ github.event.inputs.is_overseas == 'true' && steps.release_mode.outputs.centralized == 'true' }}
+        working-directory: ${{ env.RELEASE_TOOLS_DIR }}
         run: |
-          cd $WORKDIR/android
-          fastlane android release_aab flavor:${{ github.event.inputs.flavor }} is_overseas:${{ github.event.inputs.is_overseas }}
+          bundle exec fastlane android release_aab \
+            project_root:"$TARGET_APP_DIR" \
+            config_path:"$RELEASE_CONFIG_PATH" \
+            flavor:"$BUILD_FLAVOR" \
+            is_overseas:true
         env:
           PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
 
-      # 打包macOS
-      - name: Building macOS
+      - name: Build AAB with legacy project lane
+        if: ${{ github.event.inputs.is_overseas == 'true' && steps.release_mode.outputs.centralized != 'true' }}
+        working-directory: ${{ env.TARGET_APP_DIR }}/android
+        run: fastlane android release_aab flavor:"$BUILD_FLAVOR" is_overseas:true
+        env:
+          PUB_HOSTED_URL: https://pub.flutter-io.cn
+          FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
+
+      - name: Build macOS and upload TestFlight
         if: ${{ github.event.inputs.upload_macos_testflight == 'true' }}
-        run: |
-          cd $WORKDIR/macos
-          fastlane mac release_beta flavor:${{ github.event.inputs.flavor }}
+        working-directory: ${{ env.TARGET_APP_DIR }}/macos
+        run: fastlane mac release_beta flavor:"$BUILD_FLAVOR"
         env:
           PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
 
-      # 飞书机器人通知
-      - name: Notify FeiShu
-        if: always() && !cancelled()  # 排除取消状态
+      - name: Notify Feishu
+        if: always() && !cancelled() && steps.release_mode.outputs.centralized == 'true'
+        working-directory: ${{ env.RELEASE_TOOLS_DIR }}
         run: |
-          cd $WORKDIR/fastlane
-          fastlane notify_fei_shu flavor:${{ github.event.inputs.flavor }} branch:${{ github.event.inputs.branch }}
+          bundle exec fastlane notify_feishu \
+            project_root:"$TARGET_APP_DIR" \
+            config_path:"$RELEASE_CONFIG_PATH" \
+            flavor:"$BUILD_FLAVOR" \
+            branch:"$BUILD_BRANCH"
         env:
           JOB_STATUS: ${{ job.status }}
           GITHUB_ACTOR: ${{ github.actor }}
-          GITHUB_REF_NAME: ${{ github.ref_name }}
+
+      - name: Notify Feishu with legacy project lane
+        if: always() && !cancelled() && steps.release_mode.outputs.centralized != 'true'
+        working-directory: ${{ env.TARGET_APP_DIR }}
+        run: |
+          if [ ! -f fastlane/Fastfile ]; then
+            echo "Legacy notification lane not found; skipping"
+            exit 0
+          fi
+          cd fastlane
+          fastlane notify_fei_shu flavor:"$BUILD_FLAVOR" branch:"$BUILD_BRANCH"
+        env:
+          JOB_STATUS: ${{ job.status }}
+          GITHUB_ACTOR: ${{ github.actor }}

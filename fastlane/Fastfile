@@ -1,0 +1,310 @@
+# frozen_string_literal: true
+
+require "base64"
+require "English"
+require "json"
+require "net/http"
+require "tempfile"
+require "uri"
+require_relative "lib/release_config"
+
+def release_context(options)
+  project_root = File.expand_path(options[:project_root].to_s)
+  config_path = options[:config_path].to_s
+  config_path = File.join(project_root, ".github", "release.yml") if config_path.empty?
+  config_path = File.expand_path(config_path)
+  config = CentralRelease.load_config(config_path)
+  CentralRelease.validate!(config, project_root: project_root)
+  pubspec = CentralRelease.load_pubspec(project_root)
+  CentralRelease.validate_pubspec!(config, pubspec)
+  [project_root, config, pubspec]
+rescue CentralRelease::ConfigurationError => e
+  UI.user_error!(e.message)
+end
+
+def git_value(project_root, *arguments)
+  command = ["git", "-C", project_root, *arguments]
+  value = IO.popen(command, &:read).strip
+  UI.user_error!("Git 命令执行失败: #{CentralRelease.shell_join(command)}") unless $CHILD_STATUS.success?
+  value
+end
+
+def app_store_connect_api_key_from(pubspec)
+  key_id = pubspec["appstore_api_key"].to_s.strip
+  issuer_id = pubspec["appstore_api_issuer"].to_s.strip
+  key_content = pubspec["appstore_base64_content"].to_s.strip
+  UI.user_error!("pubspec.yaml 缺少 appstore_api_key") if key_id.empty?
+  UI.user_error!("pubspec.yaml 缺少 appstore_api_issuer") if issuer_id.empty?
+  UI.user_error!("pubspec.yaml 缺少 appstore_base64_content") if key_content.empty?
+
+  Tempfile.create(["app_store_connect_api_key", ".p8"]) do |file|
+    file.binmode
+    file.write(Base64.strict_decode64(key_content))
+    file.flush
+    return app_store_connect_api_key(
+      key_id: key_id,
+      issuer_id: issuer_id,
+      key_filepath: file.path,
+      in_house: false
+    )
+  end
+rescue ArgumentError
+  UI.user_error!("pubspec.yaml 中 appstore_base64_content 不是有效的 Base64")
+end
+
+desc "Validate a target project's centralized release configuration"
+lane :validate_config do |options|
+  project_root, config, = release_context(options)
+  CentralRelease.validate_runtime!(
+    config,
+    external_testing: options[:external_testing],
+    changelog: options[:changelog]
+  )
+  enabled_platforms = %w[ios android].select { |platform| CentralRelease.enabled?(config[platform]) }
+  UI.success("发布配置校验通过: #{project_root} (#{enabled_platforms.join(', ')})")
+end
+
+platform :ios do
+  desc "Build and upload the target iOS app to TestFlight"
+  lane :release_beta do |options|
+    setup_ci
+    project_root, config, pubspec = release_context(options)
+    ios = config.fetch("ios")
+    unless CentralRelease.enabled?(ios)
+      UI.message("项目未启用 iOS 发布，跳过")
+      next
+    end
+
+    flavor = options[:flavor].to_s.empty? ? "production" : options[:flavor].to_s
+    branch = git_value(project_root, "rev-parse", "--abbrev-ref", "HEAD")
+    commit = git_value(project_root, "rev-parse", "--short", "HEAD")
+    api_key = app_store_connect_api_key_from(pubspec)
+    signing_configs = ios.fetch("bundle_identifiers")
+    identifiers = signing_configs.map { |item| item.fetch("identifier") }
+    match_config = ios.fetch("match")
+
+    Dir.chdir(project_root) do
+      command = CentralRelease.ios_flutter_command(
+        config: config,
+        flavor: flavor,
+        branch: branch,
+        commit: commit
+      )
+      UI.message("执行 iOS Flutter 构建: #{CentralRelease.shell_join(command)}")
+      sh(*command)
+
+      match_options = {
+        type: match_config.fetch("type"),
+        readonly: true,
+        app_identifier: identifiers,
+        git_url: match_config.fetch("git_url"),
+        username: ios.fetch("apple_id"),
+        team_id: ios.fetch("team_id"),
+        api_key: api_key
+      }
+      match_options[:force_for_new_devices] = true if match_config["force_for_new_devices"] == true
+      match(**match_options)
+
+      provisioning_profiles = lane_context[SharedValues::MATCH_PROVISIONING_PROFILE_MAPPING] || {}
+      missing_profiles = identifiers.reject { |identifier| provisioning_profiles.key?(identifier) }
+      unless missing_profiles.empty?
+        UI.user_error!("match 未返回以下应用的 provisioning profile: #{missing_profiles.join(', ')}")
+      end
+
+      signing_configs.each do |signing_config|
+        identifier = signing_config.fetch("identifier")
+        update_code_signing_settings(
+          use_automatic_signing: false,
+          path: File.join(project_root, "ios", "Runner.xcodeproj"),
+          team_id: ios.fetch("team_id"),
+          code_sign_identity: "iPhone Distribution",
+          profile_name: provisioning_profiles.fetch(identifier),
+          targets: signing_config.fetch("targets"),
+          bundle_identifier: identifier
+        )
+      end
+
+      build_options = {
+        workspace: File.join(project_root, "ios", "Runner.xcworkspace"),
+        scheme: "Runner",
+        export_options: {
+          method: "app-store-connect",
+          teamID: ios.fetch("team_id"),
+          provisioningProfiles: provisioning_profiles
+        }
+      }
+      if ios.fetch("archive_strategy") == "flutter_archive"
+        build_options[:skip_build_archive] = true
+        build_options[:archive_path] = File.join(project_root, "build", "ios", "archive", "Runner.xcarchive")
+      else
+        build_options[:xcargs] = "allowProvisioningUpdates=true"
+      end
+      build_app(**build_options)
+
+      upload_options = CentralRelease.testflight_upload_options(
+        config: config,
+        requested: options[:external_testing],
+        changelog: options[:changelog],
+        api_key: api_key
+      )
+      if CentralRelease.truthy?(options[:external_testing]) && ios.dig("external_testing", "enabled") != true
+        UI.message("当前项目未启用外部测试，按仅上传 TestFlight 处理")
+      end
+      upload_to_testflight(**upload_options)
+    end
+  end
+end
+
+platform :android do
+  desc "Build the target Android APK and upload it to Pgyer"
+  lane :release_beta do |options|
+    setup_ci
+    project_root, config, = release_context(options)
+    android = config.fetch("android")
+    unless CentralRelease.enabled?(android)
+      UI.message("项目未启用 Android 发布，跳过")
+      next
+    end
+
+    flavor = options[:flavor].to_s.empty? ? "production" : options[:flavor].to_s
+    is_overseas = CentralRelease.truthy?(options[:is_overseas])
+    branch = git_value(project_root, "rev-parse", "--abbrev-ref", "HEAD")
+    commit = git_value(project_root, "rev-parse", "--short", "HEAD")
+
+    Dir.chdir(project_root) do
+      command = CentralRelease.android_flutter_command(
+        config: config,
+        artifact: "apk",
+        flavor: flavor,
+        branch: branch,
+        commit: commit,
+        is_overseas: is_overseas
+      )
+      UI.message("执行 Android Flutter 构建: #{CentralRelease.shell_join(command)}")
+      sh(*command)
+
+      next unless android.dig("pgyer", "enabled") == true
+
+      apk_path = CentralRelease.apk_path(config: config, project_root: project_root)
+      UI.user_error!("APK not found in build outputs") if apk_path.nil?
+      UI.message("上传 APK: #{apk_path}")
+      UI.user_error!("PGYER_API_KEY 未配置") if ENV["PGYER_API_KEY"].to_s.empty?
+      sh(
+        "curl --fail-with-body --silent --show-error " \
+        "-F #{Shellwords.escape("file=@#{apk_path}")} " \
+        "-F \"_api_key=$PGYER_API_KEY\" https://www.pgyer.com/apiv2/app/upload",
+        log: false
+      )
+    end
+  end
+
+  desc "Build the target Android AAB and optionally upload it to Google Play"
+  lane :release_aab do |options|
+    setup_ci
+    project_root, config, = release_context(options)
+    android = config.fetch("android")
+    google_play = android.fetch("google_play", {})
+    unless CentralRelease.enabled?(android) && google_play["enabled"] == true
+      UI.message("项目未启用 Google Play AAB 发布，跳过")
+      next
+    end
+
+    is_overseas = CentralRelease.truthy?(options[:is_overseas])
+    unless is_overseas
+      UI.message("非海外构建，跳过 AAB")
+      next
+    end
+
+    flavor = options[:flavor].to_s.empty? ? "production" : options[:flavor].to_s
+    branch = git_value(project_root, "rev-parse", "--abbrev-ref", "HEAD")
+    commit = git_value(project_root, "rev-parse", "--short", "HEAD")
+
+    Dir.chdir(project_root) do
+      command = CentralRelease.android_flutter_command(
+        config: config,
+        artifact: "appbundle",
+        flavor: flavor,
+        branch: branch,
+        commit: commit,
+        is_overseas: true
+      )
+      UI.message("执行 Android AAB 构建: #{CentralRelease.shell_join(command)}")
+      sh(*command)
+
+      aab_path = CentralRelease.aab_path(project_root: project_root)
+      UI.user_error!("AAB not found in build outputs") if aab_path.nil?
+      json_key_path = CentralRelease.resolve_path(project_root, google_play.fetch("json_key_path"))
+      upload_to_play_store(
+        package_name: google_play.fetch("package_name"),
+        track: google_play.fetch("track", "production"),
+        aab: aab_path,
+        json_key: json_key_path,
+        skip_upload_apk: true,
+        skip_upload_metadata: true,
+        skip_upload_images: true,
+        skip_upload_screenshots: true,
+        skip_upload_changelogs: true
+      )
+    end
+  end
+end
+
+desc "Send a best-effort Feishu build notification"
+lane :notify_feishu do |options|
+  project_root, config, pubspec = release_context(options)
+  unless config.dig("notification", "enabled") == true
+    UI.message("项目未启用飞书通知，跳过")
+    next
+  end
+
+  webhook = CentralRelease.notification_webhook(config: config, pubspec: pubspec)
+  if webhook.nil?
+    UI.message("fei_shu_webhook 未配置，跳过飞书通知")
+    next
+  end
+
+  app_name = pubspec["name"].to_s
+  version = pubspec["version"].to_s
+  version_name, build_num = version.split("+", 2)
+  flavor = options[:flavor].to_s.empty? ? "production" : options[:flavor].to_s
+  job_status = ENV.fetch("JOB_STATUS", "success")
+  actor = ENV.fetch("GITHUB_ACTOR", `whoami`.strip)
+  branch = options[:branch].to_s
+  branch = git_value(project_root, "rev-parse", "--abbrev-ref", "HEAD") if branch.empty?
+  success = job_status == "success"
+
+  text = success ? "✅ 打包上传成功，快去体验吧！🚀" : "❌ 打包失败"
+  content = "**#{text}**\n应用: #{app_name}\n版本: #{version_name}+#{build_num}\n分支: #{branch}\n触发人: #{actor}"
+  ios_url = pubspec["ios_test_url"].to_s.strip
+  android_url = pubspec["android_test_url"].to_s.strip
+  content += "\n[iOS 下载地址](#{ios_url})" unless ios_url.empty?
+  content += "\n[Android 下载地址](#{android_url})" unless android_url.empty?
+
+  card = {
+    msg_type: "interactive",
+    card: {
+      elements: [{ tag: "div", text: { tag: "lark_md", content: content } }],
+      header: {
+        template: success ? "green" : "red",
+        title: {
+          tag: "plain_text",
+          content: "#{success ? '🎉 ' : '🚨 '}#{flavor == 'production' ? '正式版' : '测试版'} #{app_name} 构建#{success ? '成功' : '失败'}"
+        }
+      }
+    }
+  }
+
+  uri = URI.parse(webhook)
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = uri.scheme == "https"
+  request = Net::HTTP::Post.new(uri.request_uri, { "Content-Type" => "application/json" })
+  request.body = JSON.generate(card)
+  response = http.request(request)
+  if response.code.to_i.between?(200, 299)
+    UI.success("飞书通知发送成功 ✅")
+  else
+    UI.error("飞书通知发送失败 ❌ HTTP #{response.code}")
+  end
+rescue StandardError => e
+  UI.error("飞书通知异常，已忽略: #{e.class}")
+end
