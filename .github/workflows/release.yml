@@ -121,6 +121,10 @@ jobs:
           bundler-cache: true
           working-directory: release-tools
 
+      - name: Verify bundled CocoaPods
+        working-directory: ${{ env.RELEASE_TOOLS_DIR }}
+        run: bundle exec pod --version
+
       - name: Setup SSH
         run: |
           mkdir -p "$HOME/.ssh"
