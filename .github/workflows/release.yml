@@ -39,6 +39,16 @@ on:
         required: true
         type: boolean
         default: true
+      external_testing:
+        description: '是否自动分发到外部测试'
+        required: true
+        type: boolean
+        default: true
+      testflight_changelog:
+        description: 'TestFlight 测试说明'
+        required: true
+        type: string
+        default: '版本更新'
       upload_macos_testflight:
         description: '是否打包 macOS 上传到 TestFlight'
         required: true
@@ -207,11 +217,12 @@ jobs:
         if: ${{ github.event.inputs.upload_testflight == 'true' }}
         run: |
           cd $WORKDIR/ios
-          fastlane ios release_beta flavor:${{ github.event.inputs.flavor }}
+          fastlane ios release_beta flavor:${{ github.event.inputs.flavor }} external_testing:${{ github.event.inputs.external_testing }} changelog:"${TESTFLIGHT_CHANGELOG}"
         env:
           PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          TESTFLIGHT_CHANGELOG: ${{ github.event.inputs.testflight_changelog }}
 
       # 打包android
       - name: Building APK
