@@ -231,7 +231,6 @@ jobs:
         working-directory: ${{ env.TARGET_APP_DIR }}
         run: dart run flutter_launcher_icons
         env:
-          PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
 
       - name: Build IPA and upload TestFlight
@@ -245,7 +244,6 @@ jobs:
             external_testing:"$EXTERNAL_TESTING" \
             changelog:"$TESTFLIGHT_CHANGELOG"
         env:
-          PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
           TESTFLIGHT_CHANGELOG: ${{ github.event.inputs.testflight_changelog }}
@@ -259,7 +257,6 @@ jobs:
             external_testing:"$EXTERNAL_TESTING" \
             changelog:"$TESTFLIGHT_CHANGELOG"
         env:
-          PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
           TESTFLIGHT_CHANGELOG: ${{ github.event.inputs.testflight_changelog }}
@@ -274,7 +271,6 @@ jobs:
             flavor:"$BUILD_FLAVOR" \
             is_overseas:"$IS_OVERSEAS"
         env:
-          PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
           PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
 
@@ -283,7 +279,6 @@ jobs:
         working-directory: ${{ env.TARGET_APP_DIR }}/android
         run: fastlane android release_beta flavor:"$BUILD_FLAVOR" is_overseas:"$IS_OVERSEAS"
         env:
-          PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
           PGYER_API_KEY: ${{ secrets.PGYER_API_KEY }}
 
@@ -297,7 +292,6 @@ jobs:
             flavor:"$BUILD_FLAVOR" \
             is_overseas:true
         env:
-          PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
 
       - name: Build AAB with legacy project lane
@@ -305,7 +299,6 @@ jobs:
         working-directory: ${{ env.TARGET_APP_DIR }}/android
         run: fastlane android release_aab flavor:"$BUILD_FLAVOR" is_overseas:true
         env:
-          PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
 
       - name: Build macOS and upload TestFlight
@@ -313,7 +306,6 @@ jobs:
         working-directory: ${{ env.TARGET_APP_DIR }}/macos
         run: fastlane mac release_beta flavor:"$BUILD_FLAVOR"
         env:
-          PUB_HOSTED_URL: https://pub.flutter-io.cn
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
 
