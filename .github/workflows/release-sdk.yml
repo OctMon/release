@@ -46,7 +46,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 180
     env:
       SDK_PROJECT: ${{ inputs.project }}
