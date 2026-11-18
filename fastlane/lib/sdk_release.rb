@@ -139,6 +139,8 @@ module SDKRelease
   end
 
   class Runner
+    TRUNK_CONFIRMATION_DELAYS = [0, 5, 15, 40, 60, 60, 60, 60].freeze
+
     def initialize(request, commands: Commands.new, env: ENV, registry: SDKRelease.method(:remote_spec),
                    trunk_confirmation: SDKRelease.method(:trunk_spec), sleeper: Kernel.method(:sleep),
                    cdn_ready: SDKRelease.method(:cdn_ready?))
@@ -414,16 +416,22 @@ module SDKRelease
       # A failed command can have published already. Query Trunk directly to avoid
       # a stale CDN response, and retry only the read while the spec propagates.
       lookup_error = nil
-      [0, 5, 15, 40].each do |delay|
+      TRUNK_CONFIRMATION_DELAYS.each_with_index do |delay, index|
+        attempt = "Trunk 复查 #{name} #{version}（#{index + 1}/#{TRUNK_CONFIRMATION_DELAYS.size}）"
+        puts "#{attempt}：等待 #{delay} 秒后查询"
         @sleeper.call(delay) if delay.positive?
         begin
           actual = @trunk_confirmation.call(name, version)
           lookup_error = nil
         rescue StandardError => e
           lookup_error = e
+          puts "#{attempt}：查询失败：#{e.message}"
           next
         end
-        next unless actual
+        unless actual
+          puts "#{attempt}：尚未查到已发布的 podspec"
+          next
+        end
         raise Error, "#{push_error.message}；Trunk 已有同名版本，但 podspec 内容不同" unless spec == actual
 
         message = "Trunk 推送命令报错，但已复查确认 #{name} #{version} 的 podspec 已发布且内容一致"
@@ -431,7 +439,7 @@ module SDKRelease
         return message
       end
       detail = lookup_error ? "：#{lookup_error.message}" : "：未查到 #{name} #{version}"
-      raise Error, "#{push_error.message}；未能确认 Trunk 发布#{detail}"
+      raise Error, "#{push_error.message}；已复查 #{TRUNK_CONFIRMATION_DELAYS.size} 次，未能确认 Trunk 发布#{detail}"
     end
 
     def write_results

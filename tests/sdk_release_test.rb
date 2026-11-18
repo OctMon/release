@@ -139,12 +139,12 @@ class SDKReleaseTest < Minitest::Test
     SDKRelease::Request.new({ project: "HXGMAdapter", version: VERSION, hx_sdk_version: SDK_VERSION }.merge(options), {})
   end
 
-  def runner(req = request, registry: nil, trunk_confirmation: ->(*) { nil }, cdn_ready: ->(*) { true })
+  def runner(req = request, registry: nil, trunk_confirmation: ->(*) { nil }, cdn_ready: ->(*) { true }, sleeper: ->(_) {})
     @commands.sdk_version = req.sdk_version
     @commands.core_selected = req.versions.key?("HXSDK")
     registry ||= ->(name, version) { @commands.spec(name, version) if name == "HXSDK" && !@commands.core_selected }
     SDKRelease::Runner.new(req, commands: @commands, env: @env, registry: registry,
-                          trunk_confirmation: trunk_confirmation, sleeper: ->(_) {}, cdn_ready: cdn_ready)
+                          trunk_confirmation: trunk_confirmation, sleeper: sleeper, cdn_ready: cdn_ready)
   end
 
   def results
@@ -235,15 +235,42 @@ class SDKReleaseTest < Minitest::Test
     assert_includes results.last.fetch("message"), "podspec 内容不同"
   end
 
+  def test_trunk_confirmation_waits_for_delayed_publication_without_pushing_again
+    @commands.trunk_push_error = "Calling the GitHub commit API timed out"
+    lookups = 0
+    delays = []
+    confirmation = lambda do |name, version|
+      lookups += 1
+      raise Net::ReadTimeout if lookups == 1
+      next unless lookups == 8
+
+      @commands.spec(name, version)
+    end
+    output, = capture_io do
+      runner(request(dry_run: false), trunk_confirmation: confirmation, sleeper: ->(delay) { delays << delay }).run
+    end
+
+    assert_equal [5, 15, 40, 60, 60, 60, 60], delays
+    assert_equal 300, delays.sum
+    assert_equal %w[published published], results.map { |r| r.fetch("status") }
+    assert_includes output, "查询失败"
+    assert_includes output, "尚未查到已发布的 podspec"
+    assert_includes output, "（8/8）"
+    assert_equal 1, @commands.calls.count { |args| args[0..4] == %w[bundle exec pod trunk push] }
+  end
+
   def test_trunk_push_timeout_still_fails_when_confirmation_is_unavailable
     @commands.trunk_push_error = "Calling the GitHub commit API timed out"
-    confirmation = ->(*) { raise SDKRelease::Error, "HTTP 503" }
+    lookups = 0
+    confirmation = ->(*) { lookups += 1; raise SDKRelease::Error, "HTTP 503" }
     capture_io do
       assert_raises(SDKRelease::Error) { runner(request(dry_run: false), trunk_confirmation: confirmation).run }
     end
     assert_equal %w[published failed], results.map { |r| r.fetch("status") }
     assert_includes results.last.fetch("message"), @commands.trunk_push_error
     assert_includes results.last.fetch("message"), "HTTP 503"
+    assert_includes results.last.fetch("message"), "已复查 8 次"
+    assert_equal 8, lookups
   end
 
   def test_specs_failure_still_attempts_trunk
