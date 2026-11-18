@@ -7,6 +7,14 @@ require "net/http"
 require "tempfile"
 require "uri"
 require_relative "lib/release_config"
+require_relative "lib/sdk_release"
+
+desc "Release HXSDK and adapter Pods from immutable version tags"
+lane :release_sdk do |options|
+  SDKRelease::Runner.new(SDKRelease::Request.new(options)).run
+rescue SDKRelease::Error => e
+  UI.user_error!(e.message)
+end
 
 def release_context(options)
   project_root = File.expand_path(options[:project_root].to_s)

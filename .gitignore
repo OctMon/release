@@ -35,3 +35,5 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+# SDK release artifacts
+sdk-release-output/

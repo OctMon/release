@@ -1,0 +1,113 @@
+name: Release SDK Pods
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: '发布项目（all 时填写全部五个版本）'
+        type: choice
+        required: true
+        options: [HXSDK, HXTakuAdapter, HXToBidAdapter, HXToBidAdapterNew, HXGMAdapter, all]
+      hx_sdk_version:
+        description: 'HXSDK 源码 tag / 产物版本，例如 5.2.11'
+        type: string
+      taku_version:
+        description: 'HXTakuAdapter 已有 tag，例如 1.5.4'
+        type: string
+      tobid_version:
+        description: 'HXToBidAdapter 已有 tag，例如 1.5.4'
+        type: string
+      tobid_new_version:
+        description: 'HXToBidAdapterNew 已有 tag，例如 1.0.3'
+        type: string
+      gm_version:
+        description: 'HXGMAdapter 已有 tag，例如 1.0.4'
+        type: string
+      target:
+        description: 'both：双发；specs：仅 Gitee Specs'
+        type: choice
+        required: true
+        default: both
+        options: [both, specs]
+      dry_run:
+        description: '只编译和校验，不创建产物 tag、不推送、不发布'
+        type: boolean
+        required: true
+        default: true
+
+permissions:
+  contents: read
+
+# All Pods share a Specs branch. Serialize releases, including partial reruns.
+concurrency:
+  group: release-sdk-pods
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 180
+    env:
+      SDK_PROJECT: ${{ inputs.project }}
+      HXSDK_VERSION: ${{ inputs.hx_sdk_version }}
+      TAKU_VERSION: ${{ inputs.taku_version }}
+      TOBID_VERSION: ${{ inputs.tobid_version }}
+      TOBID_NEW_VERSION: ${{ inputs.tobid_new_version }}
+      GM_VERSION: ${{ inputs.gm_version }}
+      POD_TARGET: ${{ inputs.target }}
+      SDK_DRY_RUN: ${{ inputs.dry_run }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize SDK paths
+        run: |
+          echo "SDK_OUTPUT_DIR=$RUNNER_TEMP/sdk-release-output" >> "$GITHUB_ENV"
+          echo "CP_HOME_DIR=$RUNNER_TEMP/sdk-cocoapods" >> "$GITHUB_ENV"
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+
+      - name: Validate release inputs
+        run: bundle exec ruby -r ./fastlane/lib/sdk_release -e 'SDKRelease::Request.new'
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: '26.2'
+
+      - name: Configure repository SSH access
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$SSH_PRIVATE_KEY" || { echo 'Missing SSH_PRIVATE_KEY'; exit 1; }
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          chmod 600 "$HOME/.ssh/id_ed25519"
+          ssh-keyscan codeup.aliyun.com gitee.com github.com >> "$HOME/.ssh/known_hosts"
+          printf 'Host codeup.aliyun.com gitee.com github.com\n  BatchMode yes\n  IdentitiesOnly yes\n  IdentityFile ~/.ssh/id_ed25519\n' >> "$HOME/.ssh/config"
+
+      - name: Test release orchestration
+        run: bundle exec ruby tests/sdk_release_test.rb
+
+      - name: Build, validate and publish SDK Pods
+        run: bundle exec fastlane release_sdk
+        env:
+          COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
+
+      - name: Upload framework and release results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-release-results
+          path: ${{ env.SDK_OUTPUT_DIR }}
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Remove job SSH key
+        if: always()
+        run: rm -f "$HOME/.ssh/id_ed25519"
