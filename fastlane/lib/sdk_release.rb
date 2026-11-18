@@ -139,7 +139,8 @@ module SDKRelease
   end
 
   class Runner
-    TRUNK_CONFIRMATION_DELAYS = [0, 5, 15, 40, 60, 60, 60, 60].freeze
+    TRUNK_PUSH_ATTEMPTS = 3
+    TRUNK_CONFIRMATION_DELAYS = [0, 5, 10].freeze
 
     def initialize(request, commands: Commands.new, env: ENV, registry: SDKRelease.method(:remote_spec),
                    trunk_confirmation: SDKRelease.method(:trunk_spec), sleeper: Kernel.method(:sleep),
@@ -410,36 +411,46 @@ module SDKRelease
     def push_trunk(root, name, version, spec)
       args = ["trunk", "push", "#{name}.podspec", "--allow-warnings", "--skip-import-validation"]
       args << "--synchronous" if name != "HXSDK" && sdk_requires_trunk_sync?
-      pod(*args, chdir: root)
-      nil
-    rescue Error => push_error
-      # A failed command can have published already. Query Trunk directly to avoid
-      # a stale CDN response, and retry only the read while the spec propagates.
+      TRUNK_PUSH_ATTEMPTS.times do |index|
+        puts "Trunk 发布 #{name} #{version}（#{index + 1}/#{TRUNK_PUSH_ATTEMPTS}）"
+        begin
+          pod(*args, chdir: root)
+          return nil
+        rescue Error => push_error
+          puts "Trunk 发布命令失败：#{push_error.message}"
+        end
+
+        # A failed push may already have published. Only a confirmed absence
+        # permits another push; lookup errors must not be treated as absence.
+        actual = confirm_trunk(name, version, push_error)
+        if actual
+          raise Error, "#{push_error.message}；Trunk 已有同名版本，但 podspec 内容不同" unless spec == actual
+
+          message = "Trunk 推送命令报错，但已复查确认 #{name} #{version} 的 podspec 已发布且内容一致"
+          puts message
+          return message
+        end
+        if index + 1 < TRUNK_PUSH_ATTEMPTS
+          puts "Trunk 未查到 #{name} #{version}，立即重试发布"
+        else
+          raise Error, "#{push_error.message}；已尝试发布 #{TRUNK_PUSH_ATTEMPTS} 次，未查到 #{name} #{version}"
+        end
+      end
+    end
+
+    def confirm_trunk(name, version, push_error)
       lookup_error = nil
       TRUNK_CONFIRMATION_DELAYS.each_with_index do |delay, index|
-        attempt = "Trunk 复查 #{name} #{version}（#{index + 1}/#{TRUNK_CONFIRMATION_DELAYS.size}）"
-        puts "#{attempt}：等待 #{delay} 秒后查询"
+        puts "Trunk 复查 #{name} #{version}（#{index + 1}/#{TRUNK_CONFIRMATION_DELAYS.size}）：等待 #{delay} 秒后查询"
         @sleeper.call(delay) if delay.positive?
         begin
-          actual = @trunk_confirmation.call(name, version)
-          lookup_error = nil
+          return @trunk_confirmation.call(name, version)
         rescue StandardError => e
           lookup_error = e
-          puts "#{attempt}：查询失败：#{e.message}"
-          next
+          puts "Trunk 复查查询失败：#{e.message}"
         end
-        unless actual
-          puts "#{attempt}：尚未查到已发布的 podspec"
-          next
-        end
-        raise Error, "#{push_error.message}；Trunk 已有同名版本，但 podspec 内容不同" unless spec == actual
-
-        message = "Trunk 推送命令报错，但已复查确认 #{name} #{version} 的 podspec 已发布且内容一致"
-        puts message
-        return message
       end
-      detail = lookup_error ? "：#{lookup_error.message}" : "：未查到 #{name} #{version}"
-      raise Error, "#{push_error.message}；已复查 #{TRUNK_CONFIRMATION_DELAYS.size} 次，未能确认 Trunk 发布#{detail}"
+      raise Error, "#{push_error.message}；已复查 #{TRUNK_CONFIRMATION_DELAYS.size} 次，未能确认 Trunk 发布：#{lookup_error.message}"
     end
 
     def write_results

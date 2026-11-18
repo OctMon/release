@@ -208,7 +208,7 @@ class SDKReleaseTest < Minitest::Test
     confirmation = lambda do |name, version|
       lookups << [name, version]
       raise Net::ReadTimeout if lookups.size == 1
-      next unless lookups.size == 4
+      next unless lookups.size == 2
 
       @commands.spec(name, version)
     end
@@ -220,7 +220,7 @@ class SDKReleaseTest < Minitest::Test
     assert_equal %w[published published], results.map { |r| r.fetch("status") }
     assert_includes results.last.fetch("message"), "已发布且内容一致"
     assert_includes output, "| HXSDK | #{SDK_VERSION} | trunk | published |"
-    assert_equal Array.new(4, ["HXSDK", SDK_VERSION]), lookups
+    assert_equal Array.new(2, ["HXSDK", SDK_VERSION]), lookups
     assert_equal 1, @commands.calls.count { |args| args[0..4] == %w[bundle exec pod trunk push] }
   end
 
@@ -233,44 +233,58 @@ class SDKReleaseTest < Minitest::Test
     assert_equal %w[published failed], results.map { |r| r.fetch("status") }
     assert_includes results.last.fetch("message"), @commands.trunk_push_error
     assert_includes results.last.fetch("message"), "podspec 内容不同"
+    assert_equal 1, @commands.calls.count { |args| args[0..4] == %w[bundle exec pod trunk push] }
   end
 
-  def test_trunk_confirmation_waits_for_delayed_publication_without_pushing_again
+  def test_trunk_republishes_immediately_when_version_is_missing
     @commands.trunk_push_error = "Calling the GitHub commit API timed out"
-    lookups = 0
     delays = []
-    confirmation = lambda do |name, version|
+    lookups = 0
+    confirmation = lambda do |*|
       lookups += 1
-      raise Net::ReadTimeout if lookups == 1
-      next unless lookups == 8
-
-      @commands.spec(name, version)
+      @commands.trunk_push_error = nil
+      nil
     end
     output, = capture_io do
       runner(request(dry_run: false), trunk_confirmation: confirmation, sleeper: ->(delay) { delays << delay }).run
     end
-
-    assert_equal [5, 15, 40, 60, 60, 60, 60], delays
-    assert_equal 300, delays.sum
+    assert_empty delays
+    assert_equal 1, lookups
     assert_equal %w[published published], results.map { |r| r.fetch("status") }
-    assert_includes output, "查询失败"
-    assert_includes output, "尚未查到已发布的 podspec"
-    assert_includes output, "（8/8）"
-    assert_equal 1, @commands.calls.count { |args| args[0..4] == %w[bundle exec pod trunk push] }
+    assert_includes output, "立即重试发布"
+    assert_equal 2, @commands.calls.count { |args| args[0..4] == %w[bundle exec pod trunk push] }
+  end
+
+  def test_trunk_republication_stops_after_three_missing_confirmations
+    @commands.trunk_push_error = "push timed out"
+    delays = []
+    capture_io do
+      assert_raises(SDKRelease::Error) do
+        runner(request(dry_run: false), sleeper: ->(delay) { delays << delay }).run
+      end
+    end
+    assert_empty delays
+    assert_includes results.last.fetch("message"), "已尝试发布 3 次"
+    assert_equal 3, @commands.calls.count { |args| args[0..4] == %w[bundle exec pod trunk push] }
   end
 
   def test_trunk_push_timeout_still_fails_when_confirmation_is_unavailable
     @commands.trunk_push_error = "Calling the GitHub commit API timed out"
     lookups = 0
+    delays = []
     confirmation = ->(*) { lookups += 1; raise SDKRelease::Error, "HTTP 503" }
     capture_io do
-      assert_raises(SDKRelease::Error) { runner(request(dry_run: false), trunk_confirmation: confirmation).run }
+      assert_raises(SDKRelease::Error) do
+        runner(request(dry_run: false), trunk_confirmation: confirmation, sleeper: ->(delay) { delays << delay }).run
+      end
     end
     assert_equal %w[published failed], results.map { |r| r.fetch("status") }
     assert_includes results.last.fetch("message"), @commands.trunk_push_error
     assert_includes results.last.fetch("message"), "HTTP 503"
-    assert_includes results.last.fetch("message"), "已复查 8 次"
-    assert_equal 8, lookups
+    assert_includes results.last.fetch("message"), "已复查 3 次"
+    assert_equal 3, lookups
+    assert_equal [5, 10], delays
+    assert_equal 1, @commands.calls.count { |args| args[0..4] == %w[bundle exec pod trunk push] }
   end
 
   def test_specs_failure_still_attempts_trunk
