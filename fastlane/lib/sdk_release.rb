@@ -80,11 +80,32 @@ module SDKRelease
     end
   end
 
-  # A missing version is different from an unavailable registry: network errors must
-  # never be treated as permission to publish or to skip an existing version.
-  def self.remote_spec(name, version, url = nil, redirects = 5)
+  def self.remote_spec(name, version)
     hash = Digest::MD5.hexdigest(name)
-    url ||= "https://cdn.cocoapods.org/Specs/#{hash[0]}/#{hash[1]}/#{hash[2]}/#{name}/#{version}/#{name}.podspec.json"
+    fetch_remote_spec("https://cdn.cocoapods.org/Specs/#{hash[0]}/#{hash[1]}/#{hash[2]}/#{name}/#{version}/#{name}.podspec.json")
+  end
+
+  def self.trunk_spec(name, version)
+    fetch_remote_spec("https://trunk.cocoapods.org/api/v1/pods/#{name}/specs/#{version}")
+  end
+
+  def self.cdn_ready?(name, version)
+    shard = Digest::MD5.hexdigest(name)[0, 3].chars.join("_")
+    index = fetch_https("https://cdn.cocoapods.org/all_pods_versions_#{shard}.txt")
+    indexed = index.to_s.each_line.any? do |row|
+      pod, *versions = row.strip.split("/")
+      pod == name && versions.include?(version)
+    end
+    indexed && !remote_spec(name, version).nil?
+  end
+
+  def self.fetch_remote_spec(url)
+    body = fetch_https(url)
+    JSON.parse(body) if body
+  end
+
+  # Only a 404 means the requested resource is missing.
+  def self.fetch_https(url, redirects = 5)
     uri = URI(url)
     raise Error, "无效的 Specs HTTPS 地址" unless uri.scheme == "https"
 
@@ -92,16 +113,18 @@ module SDKRelease
       http.get(uri.request_uri)
     end
     case response
-    when Net::HTTPSuccess then JSON.parse(response.body)
+    when Net::HTTPSuccess then response.body
     when Net::HTTPNotFound then nil
     when Net::HTTPRedirection
       raise Error, "Specs 重定向过多" if redirects.zero?
 
-      remote_spec(name, version, URI.join(url, response.fetch("location")).to_s, redirects - 1)
+      fetch_https(URI.join(url, response.fetch("location")).to_s, redirects - 1)
     else
-      raise Error, "查询 Trunk 已发布版本失败: HTTP #{response.code}"
+      raise Error, "查询 CocoaPods 发布索引失败: HTTP #{response.code}"
     end
   end
+
+  private_class_method :fetch_remote_spec, :fetch_https
 
   def self.assert_same_spec!(expected, actual)
     raise Error, "已发布的同名版本内容不同，禁止覆盖" unless expected == actual
@@ -116,8 +139,11 @@ module SDKRelease
   end
 
   class Runner
-    def initialize(request, commands: Commands.new, env: ENV, registry: SDKRelease.method(:remote_spec))
+    def initialize(request, commands: Commands.new, env: ENV, registry: SDKRelease.method(:remote_spec),
+                   trunk_confirmation: SDKRelease.method(:trunk_spec), sleeper: Kernel.method(:sleep),
+                   cdn_ready: SDKRelease.method(:cdn_ready?))
       @request, @commands, @env, @registry = request, commands, env, registry
+      @trunk_confirmation, @sleeper, @cdn_ready = trunk_confirmation, sleeper, cdn_ready
       @results = []
       @linted = {}
       @output = File.expand_path(env.fetch("SDK_OUTPUT_DIR", "sdk-release-output"))
@@ -358,13 +384,54 @@ module SDKRelease
           else
             raise Error, "缺少 COCOAPODS_TRUNK_TOKEN" if @env["COCOAPODS_TRUNK_TOKEN"].to_s.empty?
 
-            pod("trunk", "push", "#{name}.podspec", "--allow-warnings", "--skip-import-validation", "--synchronous", chdir: root)
-            record.call(target, "published")
+            record.call(target, "published", push_trunk(root, name, version, spec))
           end
         rescue StandardError => e
           record.call(target, "failed", e.message)
         end
       end
+    end
+
+    def sdk_requires_trunk_sync?
+      # Fetching a podspec by URL can succeed before the CDN version index
+      # includes it. The adapter validator needs both to resolve HXSDK.
+      @sdk_visible_on_cdn ||= @cdn_ready.call("HXSDK", @request.sdk_version)
+      return false if @sdk_visible_on_cdn
+
+      puts "CocoaPods CDN 尚未收录 HXSDK #{@request.sdk_version}，本次适配器校验使用 Git Specs"
+      true
+    rescue StandardError => e
+      puts "无法确认 CocoaPods CDN 已收录 HXSDK #{@request.sdk_version}，本次适配器校验使用 Git Specs：#{e.message}"
+      true
+    end
+
+    def push_trunk(root, name, version, spec)
+      args = ["trunk", "push", "#{name}.podspec", "--allow-warnings", "--skip-import-validation"]
+      args << "--synchronous" if name != "HXSDK" && sdk_requires_trunk_sync?
+      pod(*args, chdir: root)
+      nil
+    rescue Error => push_error
+      # A failed command can have published already. Query Trunk directly to avoid
+      # a stale CDN response, and retry only the read while the spec propagates.
+      lookup_error = nil
+      [0, 5, 15, 40].each do |delay|
+        @sleeper.call(delay) if delay.positive?
+        begin
+          actual = @trunk_confirmation.call(name, version)
+          lookup_error = nil
+        rescue StandardError => e
+          lookup_error = e
+          next
+        end
+        next unless actual
+        raise Error, "#{push_error.message}；Trunk 已有同名版本，但 podspec 内容不同" unless spec == actual
+
+        message = "Trunk 推送命令报错，但已复查确认 #{name} #{version} 的 podspec 已发布且内容一致"
+        puts message
+        return message
+      end
+      detail = lookup_error ? "：#{lookup_error.message}" : "：未查到 #{name} #{version}"
+      raise Error, "#{push_error.message}；未能确认 Trunk 发布#{detail}"
     end
 
     def write_results

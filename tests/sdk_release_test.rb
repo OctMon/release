@@ -13,7 +13,7 @@ class SDKReleaseTest < Minitest::Test
     attr_accessor :existing_tag, :provenance, :fail_target, :wrong_version, :existing_spec, :wrong_runtime,
                   :sdk_version, :core_selected, :sdk_published, :missing_sdk_tag, :main_version,
                   :tag_dependency, :fail_lint, :fail_push, :fail_resolve, :sdk_index_spec,
-                  :sdk_tag_version, :missing_lock
+                  :sdk_tag_version, :missing_lock, :trunk_push_error
     attr_reader :examples_at_update
 
     def initialize(env)
@@ -70,6 +70,7 @@ class SDKReleaseTest < Minitest::Test
         raise SDKRelease::Error, "Specs rejected" if fail_target == "specs"
         install_spec(parse_spec(File.join(chdir, args[6])))
       elsif args[0..4] == %w[bundle exec pod trunk push]
+        raise SDKRelease::Error, trunk_push_error if trunk_push_error
         raise SDKRelease::Error, "Trunk read-only" if fail_target == "trunk"
       elsif args[0..3] == %w[bundle exec pod update]
         raise SDKRelease::Error, "dependency resolution failed" if fail_resolve
@@ -138,11 +139,12 @@ class SDKReleaseTest < Minitest::Test
     SDKRelease::Request.new({ project: "HXGMAdapter", version: VERSION, hx_sdk_version: SDK_VERSION }.merge(options), {})
   end
 
-  def runner(req = request, registry: nil)
+  def runner(req = request, registry: nil, trunk_confirmation: ->(*) { nil }, cdn_ready: ->(*) { true })
     @commands.sdk_version = req.sdk_version
     @commands.core_selected = req.versions.key?("HXSDK")
     registry ||= ->(name, version) { @commands.spec(name, version) if name == "HXSDK" && !@commands.core_selected }
-    SDKRelease::Runner.new(req, commands: @commands, env: @env, registry: registry)
+    SDKRelease::Runner.new(req, commands: @commands, env: @env, registry: registry,
+                          trunk_confirmation: trunk_confirmation, sleeper: ->(_) {}, cdn_ready: cdn_ready)
   end
 
   def results
@@ -196,7 +198,52 @@ class SDKReleaseTest < Minitest::Test
     @commands.fail_target = "trunk"
     capture_io { assert_raises(SDKRelease::Error) { runner(request(dry_run: false)).run } }
     assert_equal %w[published failed], results.map { |r| r.fetch("status") }
-    assert_equal "Trunk read-only", results.last.fetch("message")
+    assert_includes results.last.fetch("message"), "Trunk read-only"
+    assert_includes results.last.fetch("message"), "未查到 HXGMAdapter #{VERSION}"
+  end
+
+  def test_trunk_push_timeout_is_reconciled_when_matching_spec_appears
+    @commands.trunk_push_error = "Calling the GitHub commit API timed out"
+    lookups = []
+    confirmation = lambda do |name, version|
+      lookups << [name, version]
+      raise Net::ReadTimeout if lookups.size == 1
+      next unless lookups.size == 4
+
+      @commands.spec(name, version)
+    end
+
+    output, = capture_io do
+      runner(request(project: "HXSDK", version: SDK_VERSION, dry_run: false), trunk_confirmation: confirmation).run
+    end
+
+    assert_equal %w[published published], results.map { |r| r.fetch("status") }
+    assert_includes results.last.fetch("message"), "已发布且内容一致"
+    assert_includes output, "| HXSDK | #{SDK_VERSION} | trunk | published |"
+    assert_equal Array.new(4, ["HXSDK", SDK_VERSION]), lookups
+    assert_equal 1, @commands.calls.count { |args| args[0..4] == %w[bundle exec pod trunk push] }
+  end
+
+  def test_trunk_push_timeout_still_fails_when_remote_spec_differs
+    @commands.trunk_push_error = "Calling the GitHub commit API timed out"
+    confirmation = ->(name, version) { @commands.spec(name, version).merge("summary" => "different") }
+    capture_io do
+      assert_raises(SDKRelease::Error) { runner(request(dry_run: false), trunk_confirmation: confirmation).run }
+    end
+    assert_equal %w[published failed], results.map { |r| r.fetch("status") }
+    assert_includes results.last.fetch("message"), @commands.trunk_push_error
+    assert_includes results.last.fetch("message"), "podspec 内容不同"
+  end
+
+  def test_trunk_push_timeout_still_fails_when_confirmation_is_unavailable
+    @commands.trunk_push_error = "Calling the GitHub commit API timed out"
+    confirmation = ->(*) { raise SDKRelease::Error, "HTTP 503" }
+    capture_io do
+      assert_raises(SDKRelease::Error) { runner(request(dry_run: false), trunk_confirmation: confirmation).run }
+    end
+    assert_equal %w[published failed], results.map { |r| r.fetch("status") }
+    assert_includes results.last.fetch("message"), @commands.trunk_push_error
+    assert_includes results.last.fetch("message"), "HTTP 503"
   end
 
   def test_specs_failure_still_attempts_trunk
@@ -430,6 +477,24 @@ class SDKReleaseTest < Minitest::Test
     assert_equal "resolve", results.first.fetch("stage")
     assert_includes results.first.fetch("message"), "未生成 Podfile.lock"
     assert_no_git_writes
+  end
+
+  def test_trunk_push_clones_specs_only_while_sdk_is_missing_from_cdn
+    versions = SDKRelease::PROJECTS.values.to_h { |_, key| [key, VERSION] }.merge("HXSDK_VERSION" => SDK_VERSION)
+    req = SDKRelease::Request.new({ project: "all", dry_run: false }, versions)
+    lookups = []
+    cdn_ready = lambda do |name, version|
+      lookups << [name, version]
+      lookups.size > 1
+    end
+
+    capture_io { runner(req, cdn_ready: cdn_ready).run }
+
+    pushes = @commands.calls.select { |args| args[0..4] == %w[bundle exec pod trunk push] }
+    assert_equal SDKRelease::PROJECTS.keys.map { |name| "#{name}.podspec" }, pushes.map { |args| args[5] }
+    assert_equal ["HXTakuAdapter.podspec"], pushes.filter_map { |args| args[5] if args.include?("--synchronous") }
+    assert_equal [["HXSDK", SDK_VERSION], ["HXSDK", SDK_VERSION]], lookups
+    assert_equal ["published"], results.map { |result| result.fetch("status") }.uniq
   end
 
   def test_all_mode_blocks_adapters_after_partial_core_publication
