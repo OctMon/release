@@ -34,7 +34,7 @@ on:
         description: '只准备版本和校验，不提交、不创建 tag、不推送、不发布'
         type: boolean
         required: true
-        default: true
+        default: false
 
 permissions:
   contents: read
@@ -82,15 +82,32 @@ jobs:
         shell: bash
         env:
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          GITEE_SSH_PRIVATE_KEY: ${{ secrets.GITEE_SSH_PRIVATE_KEY }}
         run: |
           set -euo pipefail
           test -n "$SSH_PRIVATE_KEY" || { echo 'Missing SSH_PRIVATE_KEY'; exit 1; }
+          if [[ "$SDK_DRY_RUN" != true && -z "$GITEE_SSH_PRIVATE_KEY" ]]; then
+            echo 'Missing GITEE_SSH_PRIVATE_KEY'
+            exit 1
+          fi
+          umask 077
           mkdir -p "$HOME/.ssh"
           chmod 700 "$HOME/.ssh"
-          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
-          chmod 600 "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/sdk_release_source"
+          if [[ -n "$GITEE_SSH_PRIVATE_KEY" ]]; then
+            printf '%s\n' "$GITEE_SSH_PRIVATE_KEY" > "$HOME/.ssh/sdk_release_gitee"
+          fi
           ssh-keyscan codeup.aliyun.com gitee.com github.com >> "$HOME/.ssh/known_hosts"
-          printf 'Host codeup.aliyun.com gitee.com github.com\n  BatchMode yes\n  IdentitiesOnly yes\n  IdentityFile ~/.ssh/id_ed25519\n' >> "$HOME/.ssh/config"
+          cat >> "$HOME/.ssh/config" <<'SSH_CONFIG'
+          Host codeup.aliyun.com github.com
+            IdentityFile ~/.ssh/sdk_release_source
+            BatchMode yes
+            IdentitiesOnly yes
+          Host gitee.com
+            IdentityFile ~/.ssh/sdk_release_gitee
+            BatchMode yes
+            IdentitiesOnly yes
+          SSH_CONFIG
 
       - name: Test release orchestration
         run: bundle exec ruby tests/sdk_release_test.rb
@@ -109,6 +126,6 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - name: Remove job SSH key
+      - name: Remove job SSH keys
         if: always()
-        run: rm -f "$HOME/.ssh/id_ed25519"
+        run: rm -f "$HOME/.ssh/sdk_release_source" "$HOME/.ssh/sdk_release_gitee"
