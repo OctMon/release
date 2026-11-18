@@ -9,7 +9,7 @@ require "uri"
 require_relative "lib/release_config"
 require_relative "lib/sdk_release"
 
-desc "Release HXSDK and adapter Pods from immutable version tags"
+desc "Release HXSDK from a source tag and prepare adapter releases for its version"
 lane :release_sdk do |options|
   SDKRelease::Runner.new(SDKRelease::Request.new(options)).run
 rescue SDKRelease::Error => e

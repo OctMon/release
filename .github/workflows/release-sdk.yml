@@ -4,24 +4,25 @@ on:
   workflow_dispatch:
     inputs:
       project:
-        description: '发布项目（all 时填写全部五个版本）'
+        description: 'adapters：四个适配器；all：HXSDK 和四个适配器'
         type: choice
         required: true
-        options: [HXSDK, HXTakuAdapter, HXToBidAdapter, HXToBidAdapterNew, HXGMAdapter, all]
+        options: [HXSDK, HXTakuAdapter, HXToBidAdapter, HXToBidAdapterNew, HXGMAdapter, adapters, all]
       hx_sdk_version:
-        description: 'HXSDK 源码 tag / 产物版本，例如 5.2.11'
+        description: 'HXSDK tag，例如 5.2.11；适配器模式引用已发布版本'
         type: string
+        required: true
       taku_version:
-        description: 'HXTakuAdapter 已有 tag，例如 1.5.4'
+        description: 'HXTakuAdapter 新版本 / 重跑 tag，例如 1.5.4'
         type: string
       tobid_version:
-        description: 'HXToBidAdapter 已有 tag，例如 1.5.4'
+        description: 'HXToBidAdapter 新版本 / 重跑 tag，例如 1.5.4'
         type: string
       tobid_new_version:
-        description: 'HXToBidAdapterNew 已有 tag，例如 1.0.3'
+        description: 'HXToBidAdapterNew 新版本 / 重跑 tag，例如 1.0.3'
         type: string
       gm_version:
-        description: 'HXGMAdapter 已有 tag，例如 1.0.4'
+        description: 'HXGMAdapter 新版本 / 重跑 tag，例如 1.0.4'
         type: string
       target:
         description: 'both：双发；specs：仅 Gitee Specs'
@@ -30,7 +31,7 @@ on:
         default: both
         options: [both, specs]
       dry_run:
-        description: '只编译和校验，不创建产物 tag、不推送、不发布'
+        description: '只准备版本和校验，不提交、不创建 tag、不推送、不发布'
         type: boolean
         required: true
         default: true

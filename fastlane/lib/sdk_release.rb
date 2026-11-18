@@ -7,6 +7,8 @@ require "open3"
 require "shellwords"
 require "tmpdir"
 require "digest"
+require "rubygems/version"
+require_relative "adapter_release"
 
 module SDKRelease
   class Error < StandardError; end
@@ -23,11 +25,11 @@ module SDKRelease
   }.freeze
 
   class Request
-    attr_reader :versions, :target, :dry_run
+    attr_reader :versions, :target, :dry_run, :sdk_version
 
     def initialize(options = {}, env = ENV)
       project = options[:project] || env.fetch("SDK_PROJECT", "HXSDK")
-      raise Error, "未知项目: #{project}" unless project == "all" || PROJECTS.key?(project)
+      raise Error, "未知项目: #{project}" unless %w[all adapters].include?(project) || PROJECTS.key?(project)
 
       @target = options[:target] || env.fetch("POD_TARGET", "both")
       raise Error, "target 必须为 both 或 specs" unless %w[both specs].include?(@target)
@@ -36,15 +38,21 @@ module SDKRelease
       raise Error, "dry_run 必须为 true 或 false" unless [true, false, "true", "false"].include?(dry)
 
       @dry_run = dry.to_s == "true"
-      names = project == "all" ? PROJECTS.keys : [project]
+      names = case project
+              when "all" then PROJECTS.keys
+              when "adapters" then PROJECTS.keys - ["HXSDK"]
+              else [project]
+              end
       @versions = names.to_h do |name|
         key = PROJECTS.fetch(name).last
         version = options[key.downcase.to_sym] || env[key]
-        version = options[:version] || env["SDK_VERSION"] || version if project != "all"
+        version = options[:version] || env["SDK_VERSION"] || version unless %w[all adapters].include?(project)
         raise Error, "#{name} 缺少有效版本 (#{key})，格式必须为 X.Y.Z，无 v 前缀" unless /\A\d+\.\d+\.\d+\z/.match?(version.to_s)
 
         [name, version]
       end
+      @sdk_version = @versions["HXSDK"] || options[:hx_sdk_version] || env["HXSDK_VERSION"]
+      raise Error, "必须填写 HXSDK tag (hx_sdk_version / HXSDK_VERSION)，格式为 X.Y.Z" unless /\A\d+\.\d+\.\d+\z/.match?(@sdk_version.to_s)
     end
   end
 
@@ -111,6 +119,7 @@ module SDKRelease
     def initialize(request, commands: Commands.new, env: ENV, registry: SDKRelease.method(:remote_spec))
       @request, @commands, @env, @registry = request, commands, env, registry
       @results = []
+      @linted = {}
       @output = File.expand_path(env.fetch("SDK_OUTPUT_DIR", "sdk-release-output"))
       @tools = File.expand_path("../..", __dir__)
     end
@@ -123,16 +132,24 @@ module SDKRelease
       Dir.mktmpdir("sdk-release-") do |work|
         @work = work
         setup_specs
+        prepare_sdk_dependency unless @request.versions.key?("HXSDK")
         @request.versions.each do |name, version|
+          @stage = "prepare"
           begin
-            root = name == "HXSDK" ? prepare_core(version) : clone_tag(repo_url(name), version, File.join(work, name))
+            root = name == "HXSDK" ? prepare_core(version) : prepare_adapter(name, version)
             spec = read_spec(File.join(root, "#{name}.podspec"))
             validate_spec!(spec, name, version)
-            lint(root, name) unless name == "HXSDK" && @core_linted
-            @core_spec = File.join(root, "HXSDK.podspec") if name == "HXSDK"
+            @stage = "validate"
+            lint(root, name) unless @linted[name]
+            if name == "HXSDK"
+              @core_spec = File.join(root, "HXSDK.podspec")
+              @preview_core = @request.dry_run && @linted[name]
+              @sdk_sha = git(root, "rev-parse", "HEAD", capture: true) unless @preview_core
+            end
             publish(root, name, version, spec)
+            break if name == "HXSDK" && @results.any? { |r| r[:project] == name && r[:status] == "failed" }
           rescue StandardError => e
-            @results << { project: name, version: version, stage: "prepare", status: "failed", message: e.message }
+            @results << { project: name, version: version, stage: @stage, status: "failed", message: e.message }
             # A failed core build must not let a batch appear to test the new SDK.
             break if name == "HXSDK"
           end
@@ -164,6 +181,7 @@ module SDKRelease
     end
 
     def clone_tag(repo, version, destination)
+      FileUtils.mkdir_p(File.dirname(destination))
       @commands.run("git", "clone", "--quiet", "--no-checkout", repo, destination)
       git(destination, "fetch", "--quiet", "origin", "refs/tags/#{version}")
       git(destination, "checkout", "--quiet", "--detach", "FETCH_HEAD")
@@ -179,6 +197,89 @@ module SDKRelease
       git(@specs_root, "remote", "set-url", "--push", "origin", SPECS_PUSH_URL)
       git(@specs_root, "config", "user.name", "github-actions")
       git(@specs_root, "config", "user.email", "github-actions@users.noreply.github.com")
+    end
+
+    def indexed_spec(name, version)
+      path = File.join(@specs_root, name, version, "#{name}.podspec")
+      path += ".json" if !File.file?(path) && File.file?("#{path}.json")
+      File.file?(path) ? read_spec(path) : nil
+    end
+
+    def prepare_sdk_dependency
+      root = clone_tag(repo_url("HXSDK"), @request.sdk_version, File.join(@work, "dependency", "HXSDK"))
+      @core_spec = File.join(root, "HXSDK.podspec")
+      expected = read_spec(@core_spec)
+      validate_spec!(expected, "HXSDK", @request.sdk_version)
+      @sdk_sha = git(root, "rev-parse", "HEAD", capture: true)
+      actual = indexed_spec("HXSDK", @request.sdk_version)
+      raise Error, "HXSDK #{@request.sdk_version} 尚未发布到 Specs" unless actual
+
+      SDKRelease.assert_same_spec!(expected, actual)
+      if @request.target == "both"
+        actual = @registry.call("HXSDK", @request.sdk_version)
+        raise Error, "HXSDK #{@request.sdk_version} 尚未发布到 Trunk" unless actual
+
+        SDKRelease.assert_same_spec!(expected, actual)
+      end
+    end
+
+    def validate_adapter_dependency!(spec)
+      expected = ["~> #{@request.sdk_version}"]
+      raise Error, "适配器的 HXSDK 依赖必须为 #{expected.first}，已有 tag 禁止覆盖" unless spec.dig("dependencies", "HXSDK") == expected
+    end
+
+    def prepare_adapter(name, version)
+      root = File.join(@work, name)
+      if @commands.tag_exists?(repo_url(name), version)
+        clone_tag(repo_url(name), version, root)
+        spec = read_spec(File.join(root, "#{name}.podspec"))
+        validate_spec!(spec, name, version)
+        validate_adapter_dependency!(spec)
+        recorded_sha = git(root, "log", "-1", "--format=%B", capture: true)[/^HXSDK-Dependency-SHA: (.+)$/, 1]
+        raise Error, "已有 tag 记录的 HXSDK 提交与所选 tag 不匹配" if recorded_sha && @sdk_sha && recorded_sha != @sdk_sha
+
+        return root
+      end
+
+      @commands.run("git", "clone", "--quiet", "--branch", "main", "--single-branch", repo_url(name), root)
+      current = read_spec(File.join(root, "#{name}.podspec"))
+      validate_spec!(current, name, current.fetch("version"))
+      raise Error, "#{name} 新版本必须高于 main 当前版本 #{current['version']}" unless Gem::Version.new(version) > Gem::Version.new(current.fetch("version"))
+
+      base = git(root, "rev-parse", "HEAD", capture: true)
+      paths = AdapterRelease.prepare(root: root, name: name, version: version, sdk_version: @request.sdk_version)
+      spec = read_spec(File.join(root, "#{name}.podspec"))
+      validate_spec!(spec, name, version)
+      validate_adapter_dependency!(spec)
+      example = File.join(root, AdapterRelease::EXAMPLES.fetch(name))
+      @stage = "resolve"
+      resolve = -> { pod("update", name, "HXSDK", "--no-repo-update", chdir: example) }
+      if @preview_core
+        puts "dry_run: 示例临时使用本次本地 HXSDK 产物，预览锁文件不会提交"
+        AdapterRelease.with_preview_sdk(File.join(example, "Podfile"), File.dirname(@core_spec), &resolve)
+      else
+        resolve.call
+      end
+      raise Error, "示例依赖解析未生成 Podfile.lock" unless File.file?(File.join(example, "Podfile.lock"))
+
+      @stage = "validate"
+      lint(root, name)
+      @linted[name] = true
+      unless @request.dry_run
+        @stage = "push"
+        message = "release: v#{version}\n\nHXSDK-Dependency-Tag: #{@request.sdk_version}\nHXSDK-Dependency-SHA: #{@sdk_sha}\nAdapter-Base-SHA: #{base}"
+        commit_release(root, name, version, paths, message)
+      end
+      root
+    end
+
+    def commit_release(root, name, version, paths, message)
+      git(root, "config", "user.name", "github-actions")
+      git(root, "config", "user.email", "github-actions@users.noreply.github.com")
+      git(root, "add", "--", *paths)
+      git(root, "commit", "-m", message)
+      git(root, "tag", "-a", version, "-m", message)
+      git(root, "push", "--atomic", "git@gitee.com:#{PROJECTS.fetch(name).first}.git", "HEAD:refs/heads/main", "refs/tags/#{version}")
     end
 
     def prepare_core(version)
@@ -216,16 +317,11 @@ module SDKRelease
       pod("install", chdir: example) if File.file?(File.join(example, "Podfile"))
       validate_spec!(read_spec(File.join(destination, "HXSDK.podspec")), "HXSDK", version)
       lint(destination, "HXSDK")
-      @core_linted = true
+      @linted["HXSDK"] = true
       unless @request.dry_run
-        git(destination, "config", "user.name", "github-actions")
-        git(destination, "config", "user.email", "github-actions@users.noreply.github.com")
         paths = ["HXSDK.framework", "HXSDK.podspec", "README.md", "HXSDK-iOS-Example/Podfile.lock"].select { |path| File.exist?(File.join(destination, path)) }
-        git(destination, "add", "--", *paths)
-        git(destination, "commit", "-m", "release: v#{version}\n\nHXSDK-Source-SHA: #{sha}")
-        git(destination, "tag", "-a", version, "-m", "HXSDK #{version}\nSource: #{sha}")
-        # Atomic refs prevent a branch-only or tag-only release on a failed push.
-        git(destination, "push", "--atomic", "git@gitee.com:#{PROJECTS.fetch('HXSDK').first}.git", "HEAD:refs/heads/main", "refs/tags/#{version}")
+        @stage = "push"
+        commit_release(destination, "HXSDK", version, paths, "release: v#{version}\n\nHXSDK-Source-SHA: #{sha}")
       end
       destination
     end
@@ -247,12 +343,10 @@ module SDKRelease
 
     def publish(root, name, version, spec)
       record = ->(target, status, message = nil) { @results << { project: name, version: version, stage: target, status: status, message: message } }
-      specs_file = File.join(@specs_root, name, version, "#{name}.podspec")
-      specs_file += ".json" if !File.file?(specs_file) && File.file?("#{specs_file}.json")
       targets = @request.target == "both" ? %w[specs trunk] : ["specs"]
       targets.each do |target|
         begin
-          existing = target == "specs" ? (File.file?(specs_file) ? read_spec(specs_file) : nil) : @registry.call(name, version)
+          existing = target == "specs" ? indexed_spec(name, version) : @registry.call(name, version)
           if existing
             SDKRelease.assert_same_spec!(spec, existing)
             record.call(target, "already_published")
