@@ -60,6 +60,33 @@ rescue ArgumentError
   UI.user_error!("pubspec.yaml 中 appstore_base64_content 不是有效的 Base64")
 end
 
+def record_testflight_failure(error)
+  path = ENV["TESTFLIGHT_FAILURE_PATH"].to_s
+  return if path.empty?
+
+  message = error.message.encode("UTF-8", invalid: :replace, undef: :replace).strip
+  summary = message.lines.first.to_s.strip[0, 600]
+  return if summary.empty?
+
+  File.write(path, JSON.generate(stage: "upload_to_testflight", summary: summary))
+rescue SystemCallError, IOError => e
+  UI.important("无法记录 TestFlight 错误摘要: #{e.class}")
+end
+
+def testflight_failure_summary
+  path = ENV["TESTFLIGHT_FAILURE_PATH"].to_s
+  return if path.empty? || !File.file?(path)
+
+  failure = JSON.parse(File.read(path, encoding: "UTF-8"))
+  return unless failure.is_a?(Hash) && failure["stage"] == "upload_to_testflight"
+
+  summary = failure["summary"]
+  summary if summary.is_a?(String) && !summary.strip.empty?
+rescue JSON::ParserError, SystemCallError, IOError => e
+  UI.important("无法读取 TestFlight 错误摘要: #{e.class}")
+  nil
+end
+
 desc "Validate a target project's centralized release configuration"
 lane :validate_config do |options|
   project_root, config, = release_context(options)
@@ -158,7 +185,12 @@ platform :ios do
       if CentralRelease.truthy?(options[:external_testing]) && ios.dig("external_testing", "enabled") != true
         UI.message("当前项目未启用外部测试，按仅上传 TestFlight 处理")
       end
-      upload_to_testflight(**upload_options)
+      begin
+        upload_to_testflight(**upload_options)
+      rescue Spaceship::ProgramLicenseAgreementUpdated => e
+        record_testflight_failure(e)
+        raise
+      end
     end
   end
 end
@@ -281,17 +313,33 @@ lane :notify_feishu do |options|
   branch = git_value(project_root, "rev-parse", "--abbrev-ref", "HEAD") if branch.empty?
   success = job_status == "success"
 
-  text = success ? "✅ 打包上传成功，快去体验吧！🚀" : "❌ 打包失败"
+  testflight_error = testflight_failure_summary if job_status == "failure"
+  text = if success
+           "✅ 打包上传成功，快去体验吧！🚀"
+         elsif testflight_error
+           "❌ 上传 TestFlight 失败"
+         else
+           "❌ 打包失败"
+         end
   content = "**#{text}**\n应用: #{app_name}\n版本: #{version_name}+#{build_num}\n分支: #{branch}\n触发人: #{actor}"
   ios_url = pubspec["ios_test_url"].to_s.strip
   android_url = pubspec["android_test_url"].to_s.strip
   content += "\n[iOS 下载地址](#{ios_url})" unless ios_url.empty?
   content += "\n[Android 下载地址](#{android_url})" unless android_url.empty?
 
+  if testflight_error
+    server, repository, run_id = ENV.values_at("GITHUB_SERVER_URL", "GITHUB_REPOSITORY", "GITHUB_RUN_ID")
+    if [server, repository, run_id].all? { |value| !value.to_s.empty? }
+      content += "\n[查看 Actions 运行](#{server}/#{repository}/actions/runs/#{run_id})"
+    end
+  end
+  elements = [{ tag: "div", text: { tag: "lark_md", content: content } }]
+  elements << { tag: "div", text: { tag: "plain_text", content: testflight_error } } if testflight_error
+
   card = {
     msg_type: "interactive",
     card: {
-      elements: [{ tag: "div", text: { tag: "lark_md", content: content } }],
+      elements: elements,
       header: {
         template: success ? "green" : "red",
         title: {
