@@ -9,11 +9,11 @@ class SDKReleaseTest < Minitest::Test
 
   # Simulates Git, CocoaPods and Xcode without executing any external command.
   class Commands
-    attr_reader :calls
+    attr_reader :calls, :partial_specs_path
     attr_accessor :existing_tag, :provenance, :fail_target, :wrong_version, :existing_spec, :wrong_runtime,
                   :sdk_version, :core_selected, :sdk_published, :missing_sdk_tag, :main_version,
                   :tag_dependency, :fail_lint, :fail_push, :fail_resolve, :sdk_index_spec,
-                  :sdk_tag_version, :missing_lock, :trunk_push_error
+                  :sdk_tag_version, :missing_lock, :trunk_push_error, :specs_clone_failures
     attr_reader :examples_at_update
 
     def initialize(env)
@@ -28,12 +28,7 @@ class SDKReleaseTest < Minitest::Test
 
     def run(*args, chdir: nil)
       @calls << args
-      if args[0..3] == %w[bundle exec pod repo] && args[4] == "add"
-        @specs = File.join(@env.fetch("CP_HOME_DIR"), "repos", args[5])
-        FileUtils.mkdir_p(@specs)
-        install_spec(sdk_index_spec || spec("HXSDK", sdk_version)) if sdk_published && !core_selected
-        install_spec(existing_spec) if existing_spec
-      elsif args[0..1] == %w[git clone]
+      if args[0..1] == %w[git clone]
         destination = args.last
         FileUtils.mkdir_p(destination)
         if destination.end_with?("/source")
@@ -86,6 +81,19 @@ class SDKReleaseTest < Minitest::Test
 
     def capture(*args, chdir: nil)
       @calls << args
+      if args[0..4] == %w[bundle exec pod repo add]
+        @specs = File.join(@env.fetch("CP_HOME_DIR"), "repos", args[5])
+        raise SDKRelease::Error, "destination already exists" if File.exist?(@specs)
+
+        FileUtils.mkdir_p(@specs)
+        if (failure = specs_clone_failures&.shift)
+          @partial_specs_path = @specs
+          raise SDKRelease::Error, "命令执行失败: bundle\n#{failure}"
+        end
+        install_spec(sdk_index_spec || spec("HXSDK", sdk_version)) if sdk_published && !core_selected
+        install_spec(existing_spec) if existing_spec
+        return "Cloning spec repo"
+      end
       if args[0..4] == %w[bundle exec pod ipc spec]
         return JSON.generate(parse_spec(args.last))
       end
@@ -360,6 +368,38 @@ class SDKReleaseTest < Minitest::Test
     @commands.wrong_runtime = "0.0.0"
     capture_io { assert_raises(SDKRelease::Error) { runner(request(project: "HXSDK")).run } }
     refute @commands.calls.any? { |c| c.first == "bash" || c.include?("push") }
+  end
+
+  def test_specs_setup_retries_ssl_timeout_then_runs_release
+    @commands.specs_clone_failures = ["fatal: unable to access Specs: SSL connection timeout"]
+    delays = []
+    output, = capture_io { runner(sleeper: ->(delay) { delays << delay }).run }
+
+    assert_equal [5], delays
+    assert_includes output, "SSL connection timeout"
+    assert_equal %w[dry_run dry_run], results.map { |row| row.fetch("status") }
+  end
+
+  def test_specs_setup_stops_after_three_network_failures_and_keeps_the_cause
+    @commands.specs_clone_failures = Array.new(3, "fatal: unable to access Specs: SSL connection timeout")
+    delays = []
+    capture_io do
+      assert_raises(SDKRelease::Error) { runner(sleeper: ->(delay) { delays << delay }).run }
+    end
+
+    assert_equal [5, 15], delays
+    assert_equal %w[failed blocked], results.map { |row| row.fetch("status") }
+    assert_includes results.first.fetch("message"), "SSL connection timeout"
+    refute File.exist?(@commands.partial_specs_path)
+    assert_no_git_writes
+  end
+
+  def test_specs_setup_does_not_retry_authentication_failure
+    @commands.specs_clone_failures = ["fatal: Authentication failed"]
+    capture_io do
+      assert_raises(SDKRelease::Error) { runner(sleeper: ->(_) { flunk "unexpected retry" }).run }
+    end
+    assert_includes results.first.fetch("message"), "Authentication failed"
   end
 
   def test_missing_trunk_token_fails_before_preparing_release

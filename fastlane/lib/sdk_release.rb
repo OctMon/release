@@ -146,6 +146,8 @@ module SDKRelease
   end
 
   class Runner
+    SPECS_CLONE_DELAYS = [0, 5, 15].freeze
+    TRANSIENT_SPECS_CLONE_ERROR = /(?:SSL connection timeout|Connection timed out|Operation timed out|Connection reset by peer|Failed to connect|Could not resolve host|returned error: (?:429|502|503|504))/i
     TRUNK_PUSH_ATTEMPTS = 3
     TRUNK_CONFIRMATION_DELAYS = [0, 5, 10].freeze
 
@@ -230,12 +232,30 @@ module SDKRelease
     def setup_specs
       # Use a per-run repo so concurrent local jobs never modify each other's Specs.
       @repo_name = "hxsdk-release-#{Process.pid}-#{File.basename(@work)}"
-      pod("repo", "add", @repo_name, SPECS_URL, "main")
       repos = @env.fetch("CP_REPOS_DIR", File.join(@env.fetch("CP_HOME_DIR", File.expand_path("~/.cocoapods")), "repos"))
       @specs_root = File.join(repos, @repo_name)
+      clone_specs
       git(@specs_root, "remote", "set-url", "--push", "origin", SPECS_PUSH_URL)
       git(@specs_root, "config", "user.name", "github-actions")
       git(@specs_root, "config", "user.email", "github-actions@users.noreply.github.com")
+    end
+
+    def clone_specs
+      SPECS_CLONE_DELAYS.each_with_index do |delay, index|
+        @sleeper.call(delay) if delay.positive?
+        puts "克隆 Gitee Specs（#{index + 1}/#{SPECS_CLONE_DELAYS.size}）：#{SPECS_URL}"
+        begin
+          puts pod("repo", "add", @repo_name, SPECS_URL, "main", capture: true)
+          return
+        rescue Error => e
+          detail = e.message.lines.drop(1).map(&:strip).reject(&:empty?).last || e.message
+          raise Error, "克隆 Gitee Specs 失败：#{detail}" unless e.message.match?(TRANSIENT_SPECS_CLONE_ERROR)
+          raise Error, "克隆 Gitee Specs 已尝试 #{index + 1} 次：#{detail}" if index + 1 == SPECS_CLONE_DELAYS.size
+
+          puts "Gitee Specs 网络错误，将重试：#{detail}"
+          FileUtils.rm_rf(@specs_root)
+        end
+      end
     end
 
     def indexed_spec(name, version)
