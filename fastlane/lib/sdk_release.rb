@@ -25,11 +25,12 @@ module SDKRelease
   }.freeze
 
   class Request
-    attr_reader :versions, :target, :dry_run, :sdk_version
+    attr_reader :versions, :skipped_projects, :target, :dry_run, :sdk_version
 
     def initialize(options = {}, env = ENV)
       project = options[:project] || env.fetch("SDK_PROJECT", "HXSDK")
-      raise Error, "未知项目: #{project}" unless %w[all adapters].include?(project) || PROJECTS.key?(project)
+      batch = %w[all adapters].include?(project)
+      raise Error, "未知项目: #{project}" unless batch || PROJECTS.key?(project)
 
       @target = options[:target] || env.fetch("POD_TARGET", "both")
       raise Error, "target 必须为 both 或 specs" unless %w[both specs].include?(@target)
@@ -43,14 +44,20 @@ module SDKRelease
               when "adapters" then PROJECTS.keys - ["HXSDK"]
               else [project]
               end
-      @versions = names.to_h do |name|
+      @skipped_projects = []
+      @versions = names.each_with_object({}) do |name, versions|
         key = PROJECTS.fetch(name).last
         version = options[key.downcase.to_sym] || env[key]
-        version = options[:version] || env["SDK_VERSION"] || version unless %w[all adapters].include?(project)
+        version = options[:version] || env["SDK_VERSION"] || version unless batch
+        if batch && name != "HXSDK" && version.to_s.strip.empty?
+          @skipped_projects << name
+          next
+        end
         raise Error, "#{name} 缺少有效版本 (#{key})，格式必须为 X.Y.Z，无 v 前缀" unless /\A\d+\.\d+\.\d+\z/.match?(version.to_s)
 
-        [name, version]
+        versions[name] = version
       end
+      raise Error, "adapters 模式至少填写一个适配器版本" if @versions.empty?
       @sdk_version = @versions["HXSDK"] || options[:hx_sdk_version] || env["HXSDK_VERSION"]
       raise Error, "必须填写 HXSDK tag (hx_sdk_version / HXSDK_VERSION)，格式为 X.Y.Z" unless /\A\d+\.\d+\.\d+\z/.match?(@sdk_version.to_s)
     end
@@ -191,6 +198,9 @@ module SDKRelease
     ensure
       (@request.versions.keys - @results.map { |r| r[:project] }).each do |name|
         @results << { project: name, version: @request.versions.fetch(name), stage: "prepare", status: "blocked", message: "前置步骤失败，未发布" }
+      end
+      @request.skipped_projects.each do |name|
+        @results << { project: name, version: "-", stage: "prepare", status: "skipped", message: "未填写适配器版本" }
       end
       write_results
     end

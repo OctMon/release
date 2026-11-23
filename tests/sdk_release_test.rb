@@ -161,6 +161,10 @@ class SDKReleaseTest < Minitest::Test
     env = SDKRelease::PROJECTS.values.to_h { |_, key| [key, VERSION] }.merge("SDK_PROJECT" => "all")
     assert_equal SDKRelease::PROJECTS.keys, SDKRelease::Request.new({}, env).versions.keys
     env.delete("GM_VERSION")
+    req = SDKRelease::Request.new({}, env)
+    assert_equal SDKRelease::PROJECTS.keys - ["HXGMAdapter"], req.versions.keys
+    assert_equal ["HXGMAdapter"], req.skipped_projects
+    env.delete("HXSDK_VERSION")
     assert_raises(SDKRelease::Error) { SDKRelease::Request.new({}, env) }
   end
 
@@ -394,14 +398,32 @@ class SDKReleaseTest < Minitest::Test
     assert_equal SDK_VERSION, request.sdk_version
   end
 
-  def test_adapters_batch_requires_four_versions_and_one_sdk_tag
-    env = SDKRelease::PROJECTS.values.to_h { |_, key| [key, VERSION] }
-    env.merge!("SDK_PROJECT" => "adapters", "HXSDK_VERSION" => SDK_VERSION)
+  def test_adapters_batch_skips_missing_version_and_releases_the_three_selected_adapters
+    env = { "SDK_PROJECT" => "adapters", "HXSDK_VERSION" => SDK_VERSION, "SDK_DRY_RUN" => "false",
+            "TAKU_VERSION" => VERSION, "TOBID_VERSION" => VERSION, "TOBID_NEW_VERSION" => VERSION, "GM_VERSION" => "" }
     req = SDKRelease::Request.new({}, env)
-    assert_equal SDKRelease::PROJECTS.keys - ["HXSDK"], req.versions.keys
     assert_equal SDK_VERSION, req.sdk_version
-    env.delete("GM_VERSION")
-    assert_raises(SDKRelease::Error) { SDKRelease::Request.new({}, env) }
+
+    capture_io { runner(req).run }
+
+    pushes = @commands.calls.select { |args| args[0..4] == %w[bundle exec pod trunk push] }
+    assert_equal %w[HXTakuAdapter.podspec HXToBidAdapter.podspec HXToBidAdapterNew.podspec], pushes.map { |args| args[5] }
+    assert_equal 6, results.count { |row| row.fetch("status") == "published" }
+    assert_equal [{ "project" => "HXGMAdapter", "version" => "-", "stage" => "prepare",
+                    "status" => "skipped", "message" => "未填写适配器版本" }], results.select { |row| row.fetch("project") == "HXGMAdapter" }
+    refute @commands.calls.flatten.any? { |arg| arg.include?("hxgm-adapter-ios") }
+  end
+
+  def test_adapter_batch_rejects_empty_selection_invalid_version_and_missing_sdk_tag
+    env = { "SDK_PROJECT" => "adapters", "HXSDK_VERSION" => SDK_VERSION }
+    assert_includes assert_raises(SDKRelease::Error) { SDKRelease::Request.new({}, env) }.message, "至少填写一个适配器版本"
+    assert_includes assert_raises(SDKRelease::Error) {
+      SDKRelease::Request.new({}, env.merge("TAKU_VERSION" => VERSION, "GM_VERSION" => "v1.2.3"))
+    }.message, "GM_VERSION"
+    assert_includes assert_raises(SDKRelease::Error) {
+      SDKRelease::Request.new({}, env.merge("TAKU_VERSION" => VERSION, "HXSDK_VERSION" => ""))
+    }.message, "必须填写 HXSDK tag"
+    assert_includes assert_raises(SDKRelease::Error) { request(version: "") }.message, "GM_VERSION"
   end
 
   def test_adapter_release_orders_resolution_lint_atomic_push_and_publication
