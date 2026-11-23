@@ -238,6 +238,10 @@ module NativeIOSRelease
   end
 
   def validate_profile!(profile, identifier:, team:, fingerprint_candidates:, app_groups: [], now: Time.now)
+    if profile["IsXcodeManaged"] == true
+      raise Error, "#{identifier} 的描述文件由 Xcode 自动管理，请在 Match 中替换成手动创建的 App Store Connect 描述文件"
+    end
+
     entitlements = profile.fetch("Entitlements", {})
     prefix, bundle = entitlements["application-identifier"].to_s.split(".", 2)
     unless bundle == identifier && Array(profile["TeamIdentifier"]).include?(team) &&

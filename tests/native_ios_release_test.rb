@@ -113,6 +113,8 @@ class NativeIOSReleaseTest < Minitest::Test
       }
     }
     assert_equal "test-profile", Release.validate_profile!(profile, **signing)
+    managed_error = assert_raises(Release::Error) { Release.validate_profile!(profile.merge("IsXcodeManaged" => true), **signing) }
+    assert_match(/由 Xcode 自动管理/, managed_error.message)
     assert_raises(Release::Error) { Release.validate_profile!(profile, **signing.merge(identifier: "com.ting.lan")) }
     assert_raises(Release::Error) { Release.validate_profile!(profile, **signing.merge(team: "OTHER_TEAM")) }
     assert_raises(Release::Error) { Release.validate_profile!(profile, **signing.merge(fingerprint_candidates: [])) }
