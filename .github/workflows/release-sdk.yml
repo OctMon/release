@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       project:
-        description: 'adapters：四个适配器；all：HXSDK 和四个适配器'
+        description: 'adapters：仅发布已填版本的适配器；all：发布 HXSDK 和已填版本的适配器'
         type: choice
         required: true
         options: [HXSDK, HXTakuAdapter, HXToBidAdapter, HXToBidAdapterNew, HXGMAdapter, adapters, all]
