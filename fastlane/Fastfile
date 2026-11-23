@@ -9,7 +9,6 @@ require "tempfile"
 require "uri"
 require_relative "lib/release_config"
 require_relative "lib/sdk_release"
-require_relative "lib/native_ios_release"
 
 desc "Release HXSDK from a source tag and prepare adapter releases for its version"
 lane :release_sdk do |options|
@@ -177,9 +176,10 @@ end
 platform :ios do
   desc "Archive and verify an App Store IPA for a registered native iOS project"
   lane :build_native_testflight do
+    require_relative "lib/native_ios_release"
     config = NativeIOSRelease.project
     NativeIOSRelease.changelog
-    group_id = NativeIOSRelease.required("TESTFLIGHT_EXTERNAL_GROUP_ID")
+    group_selector = NativeIOSRelease.required("TESTFLIGHT_EXTERNAL_GROUP")
     branch = NativeIOSRelease.branch(config)
     settings = NativeIOSRelease.build_settings(config)
     app_settings = settings.fetch(config.fetch("app_target"))
@@ -192,7 +192,7 @@ platform :ios do
 
     api_key = native_asc_api_key
     app = native_testflight_app(identifier)
-    NativeIOSRelease.external_group!(app, group_id)
+    group = NativeIOSRelease.external_group!(app, group_selector)
     uploaded = latest_testflight_build_number(api_key: api_key, app_identifier: identifier,
                                               version: version, platform: "ios", initial_build_number: 0)
     build_number = NativeIOSRelease.next_build_number(app_settings.fetch("CURRENT_PROJECT_VERSION"), uploaded)
@@ -225,14 +225,15 @@ platform :ios do
     UI.user_error!("没有生成 dSYM 压缩包") unless dsym && File.file?(dsym)
     result = { source_sha: source_sha, release_sha: release_sha, branch: branch, version: version,
                build_number: build_number, artifact_name: artifact_name }
-    File.write(NativeIOSRelease.metadata_path, JSON.generate(result.merge(ipa: ipa, identifier: identifier)))
+    File.write(NativeIOSRelease.metadata_path, JSON.generate(result.merge(ipa: ipa, identifier: identifier, testflight_group_id: group.id)))
     NativeIOSRelease.outputs(result)
-  rescue NativeIOSRelease::Error => e
+  rescue LoadError, NativeIOSRelease::Error => e
     UI.user_error!(e.message)
   end
 
   desc "Upload the verified native iOS IPA and wait for Apple processing"
   lane :upload_native_testflight do
+    require_relative "lib/native_ios_release"
     build = NativeIOSRelease.metadata
     upload_to_testflight(
       api_key: native_asc_api_key,
@@ -242,16 +243,17 @@ platform :ios do
       skip_waiting_for_build_processing: false,
       wait_processing_timeout_duration: 1800
     )
-  rescue NativeIOSRelease::Error => e
+  rescue LoadError, NativeIOSRelease::Error => e
     UI.user_error!(e.message)
   end
 
   desc "Distribute the exact uploaded version and build to the configured TestFlight group"
   lane :distribute_native_testflight do
+    require_relative "lib/native_ios_release"
     build = NativeIOSRelease.metadata
     api_key = native_asc_api_key
     app = native_testflight_app(build.fetch("identifier"))
-    group = NativeIOSRelease.external_group!(app, NativeIOSRelease.required("TESTFLIGHT_EXTERNAL_GROUP_ID"))
+    group = NativeIOSRelease.external_group!(app, build.fetch("testflight_group_id"))
     version = build.fetch("version")
     build_number = build.fetch("build_number").to_s
     upload_to_testflight(
@@ -282,7 +284,7 @@ platform :ios do
 
     NativeIOSRelease.outputs(status: status)
     UI.success(status)
-  rescue NativeIOSRelease::Error => e
+  rescue LoadError, NativeIOSRelease::Error => e
     UI.user_error!(e.message)
   end
 
