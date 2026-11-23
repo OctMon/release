@@ -1,0 +1,129 @@
+name: Release Native iOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      project:
+        description: '原生 iOS 项目'
+        type: choice
+        required: true
+        options: [tinglan]
+      branch:
+        description: '源码分支，留空使用项目默认分支'
+        type: string
+        required: false
+      testflight_external_group:
+        description: 'TestFlight 外部测试组名称或 ID'
+        type: string
+        required: true
+        default: '外部'
+      testflight_changelog:
+        description: 'TestFlight 外测说明'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-ios-${{ inputs.project }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and distribute iOS
+    runs-on: xcode-27
+    timeout-minutes: 75
+    environment: native-ios-${{ inputs.project }}
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+      NATIVE_PROJECT: ${{ inputs.project }}
+      NATIVE_BRANCH: ${{ inputs.branch }}
+      NATIVE_CHANGELOG: ${{ inputs.testflight_changelog }}
+      TESTFLIGHT_EXTERNAL_GROUP: ${{ inputs.testflight_external_group }}
+      FASTLANE_SKIP_UPDATE_CHECK: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify Xcode and iOS SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "$DEVELOPER_DIR/usr/bin/xcodebuild" || { echo "Missing Xcode 27.2 at $DEVELOPER_DIR"; exit 1; }
+          xcode_version="$(xcodebuild -version)"
+          echo "$xcode_version"
+          test "${xcode_version%%$'\n'*}" = "Xcode 27.2" || { echo "Expected Xcode 27.2"; exit 1; }
+          sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+          test "$sdk_version" = "27.2" || { echo "Expected iOS SDK 27.2, found $sdk_version"; exit 1; }
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+
+      - name: Checkout native app source
+        run: bundle exec ruby -r ./fastlane/lib/native_ios_release -e 'NativeIOSRelease.checkout!'
+        env:
+          TARGET_REPO: ${{ secrets[inputs.project] }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Build and verify signed IPA
+        id: archive
+        run: bundle exec fastlane ios build_native_testflight
+        env:
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Save IPA and dSYM
+        id: artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.archive.outputs.artifact_name }}
+          path: |
+            ${{ runner.temp }}/native-ios-output/*.ipa
+            ${{ runner.temp }}/native-ios-output/*.dSYM.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Write build number back to the source branch
+        id: writeback
+        run: bundle exec ruby -r ./fastlane/lib/native_ios_release -e 'NativeIOSRelease.push_version!'
+        env:
+          TARGET_REPO: ${{ secrets[inputs.project] }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Upload IPA and wait for Apple processing
+        id: upload
+        run: bundle exec fastlane ios upload_native_testflight
+
+      - name: Distribute this build to the external group
+        id: distribute
+        run: bundle exec fastlane ios distribute_native_testflight
+
+      - name: Summarize release
+        if: always()
+        shell: bash
+        env:
+          IPA_STATUS: ${{ steps.archive.outcome }}
+          ARTIFACT_STATUS: ${{ steps.artifact.outcome }}
+          ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
+          VERSION_STATUS: ${{ steps.writeback.outcome }}
+          UPLOAD_STATUS: ${{ steps.upload.outcome }}
+          DISTRIBUTION_STATUS: ${{ steps.distribute.outputs.status || steps.distribute.outcome }}
+          SOURCE_BRANCH: ${{ steps.archive.outputs.branch }}
+          SOURCE_SHA: ${{ steps.archive.outputs.release_sha }}
+          VERSION: ${{ steps.archive.outputs.version }}
+          BUILD_NUMBER: ${{ steps.archive.outputs.build_number }}
+        run: |
+          {
+            printf '### 原生 iOS 发布 · %s\n\n' "$NATIVE_PROJECT"
+            if [[ -n "$VERSION" ]]; then
+              printf '版本：%s（%s） · 分支：%s · 源码：%s\n\n' "$VERSION" "$BUILD_NUMBER" "$SOURCE_BRANCH" "$SOURCE_SHA"
+            fi
+            printf -- '- 签名打包：%s\n- IPA 产物：%s\n- 源码构建号回写：%s\n- TestFlight 上传及处理：%s\n- 外部测试：%s\n' \
+              "$IPA_STATUS" "$ARTIFACT_STATUS" "$VERSION_STATUS" "$UPLOAD_STATUS" "$DISTRIBUTION_STATUS"
+            if [[ -n "$ARTIFACT_URL" ]]; then printf '\n[下载 IPA 和 dSYM](%s)\n' "$ARTIFACT_URL"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
