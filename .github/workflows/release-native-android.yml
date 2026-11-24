@@ -14,8 +14,8 @@ on:
         type: string
         required: false
       upload_internal:
-        description: Upload to Google Play internal testing after the initial manual upload
-        default: false
+        description: '上传 AAB 到 Google Play 内部测试草稿（首次手动上传后使用）'
+        default: true
         type: boolean
 
 permissions:
@@ -132,7 +132,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload to Google Play internal testing
+      - name: Upload a draft to Google Play internal testing
         if: inputs.upload_internal
         env:
           PLAY_KEY_JSON: ${{ secrets[format('{0}_PLAY_SERVICE_ACCOUNT_JSON', inputs.project)] }}

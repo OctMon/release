@@ -396,7 +396,7 @@ platform :ios do
 end
 
 platform :android do
-  desc "Upload a prebuilt native Android AAB to internal testing"
+  desc "Upload a prebuilt native Android AAB as an internal testing draft"
   lane :upload_native_aab do
     require_relative "lib/native_android_release"
     project = NativeAndroidRelease.project
@@ -414,6 +414,9 @@ platform :android do
     upload_to_play_store(
       package_name: project.fetch("package_name"),
       track: "internal",
+      release_status: "draft",
+      changes_not_sent_for_review: true,
+      rescue_changes_not_sent_for_review: false,
       aab: project.fetch("bundle"),
       json_key: key_path,
       skip_upload_apk: true,
