@@ -14,7 +14,7 @@ on:
         type: string
         required: false
       upload_production:
-        description: '上传 AAB 到 Google Play 正式轨道并自动送审'
+        description: '上传 AAB 到 Google Play 正式轨道并送审。Play 仅接受草稿时保存为草稿'
         default: true
         type: boolean
 

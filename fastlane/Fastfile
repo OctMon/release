@@ -443,7 +443,7 @@ platform :android do
     if uploaded && version <= uploaded
       UI.user_error!("Google Play has reached versionCode #{uploaded}. Dispatch a new build to allocate a higher code.")
     end
-    upload_to_play_store(
+    upload_options = {
       package_name: project.fetch("package_name"),
       track: "production",
       aab: project.fetch("bundle"),
@@ -453,7 +453,25 @@ platform :android do
       skip_upload_images: true,
       skip_upload_screenshots: true,
       skip_upload_changelogs: true
-    )
+    }
+    begin
+      upload_to_play_store(**upload_options)
+    rescue FastlaneCore::Interface::FastlaneError => error
+      raise unless error.message.include?("Only releases with status draft may be created on draft app")
+
+      UI.important("Google Play requires a draft release for this app. Retrying the production upload as a draft.")
+      upload_to_play_store(
+        **upload_options,
+        release_status: "draft",
+        changes_not_sent_for_review: true,
+        rescue_changes_not_sent_for_review: false
+      )
+      message = "Google Play production versionCode #{version} was saved as a draft. Complete the first release submission in Play Console."
+      UI.important(message)
+      if ENV["GITHUB_STEP_SUMMARY"]
+        File.open(ENV.fetch("GITHUB_STEP_SUMMARY"), "a") { |file| file.puts("\n#{message}") }
+      end
+    end
   end
 
   desc "Build the target Android APK and upload it to Pgyer"
