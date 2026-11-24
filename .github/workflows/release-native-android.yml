@@ -1,0 +1,124 @@
+name: Release Native Android
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full source commit SHA from the independent Tinglan Android main branch
+        required: true
+        type: string
+      upload_internal:
+        description: Upload to Google Play internal testing after the initial manual upload
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-android-com.ting.lan
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: native-android-tinglan
+    env:
+      TARGET_APP_DIR: ${{ github.workspace }}/tinglan-android
+      VERSION_CODE: ${{ github.run_number }}
+      FASTLANE_SKIP_UPDATE_CHECK: '1'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+
+      - name: Checkout the requested source commit
+        env:
+          TARGET_REPO: ${{ secrets.TINGLAN_ANDROID_REPO }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: ruby -r ./fastlane/lib/native_android_release -e 'NativeAndroidRelease.checkout!'
+
+      - name: Read the app release configuration
+        id: config
+        run: ruby -r ./fastlane/lib/native_android_release -e 'NativeAndroidRelease.describe!'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android and audio verification tools
+        run: |
+          sdkmanager "platforms;android-37.0" "build-tools;36.0.0"
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Validate the source catalog
+        run: python3 "$TARGET_APP_DIR/scripts/validate_catalog.py"
+
+      - name: Run unit tests and Android lint
+        working-directory: ${{ steps.config.outputs.project }}
+        run: ./gradlew :app:testDebugUnitTest :app:lintRelease
+
+      - name: Build the signed Android App Bundle
+        working-directory: ${{ steps.config.outputs.project }}
+        run: ./gradlew :app:bundleRelease -PtinglanVersionCode="$VERSION_CODE"
+
+      - name: Verify and record the release artifact
+        env:
+          AAB: ${{ steps.config.outputs.bundle }}
+          PACKAGE_NAME: ${{ steps.config.outputs.package_name }}
+        run: |
+          set -euo pipefail
+          jarsigner -J-Duser.language=en -J-Duser.country=US -verify "$AAB" | grep -F 'jar verified.'
+          python3 "$TARGET_APP_DIR/scripts/validate_bundle.py" "$AAB"
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/google/bundletool/releases/download/1.18.2/bundletool-all-1.18.2.jar \
+            --output "$RUNNER_TEMP/bundletool.jar"
+          java -jar "$RUNNER_TEMP/bundletool.jar" validate --bundle="$AAB"
+          manifest_value() {
+            java -jar "$RUNNER_TEMP/bundletool.jar" dump manifest --bundle="$AAB" --xpath="$1"
+          }
+          test "$(manifest_value /manifest/@package)" = "$PACKAGE_NAME"
+          test "$(manifest_value /manifest/@android:versionCode)" = "$VERSION_CODE"
+          revision="$(git -C "$TARGET_APP_DIR" rev-parse HEAD)"
+          {
+            printf 'Package: %s\nVersion: %s (%s)\nCommit: %s\n' "$PACKAGE_NAME" \
+              "$(manifest_value /manifest/@android:versionName)" "$VERSION_CODE" "$revision"
+            printf 'AAB bytes: %s\n' "$(wc -c < "$AAB" | tr -d ' ')"
+            printf 'AAB SHA-256: %s\n' "$(sha256sum "$AAB" | cut -d' ' -f1)"
+          } | tee "$RUNNER_TEMP/tinglan-release.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tinglan-aab-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.config.outputs.bundle }}
+            ${{ steps.config.outputs.mapping }}
+            ${{ runner.temp }}/tinglan-release.txt
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload to Google Play internal testing
+        if: inputs.upload_internal
+        env:
+          PLAY_KEY_JSON: ${{ secrets.TINGLAN_PLAY_SERVICE_ACCOUNT_JSON }}
+        run: |
+          set -euo pipefail
+          : "${PLAY_KEY_JSON:?Configure the Tinglan Play testing service account secret}"
+          umask 077
+          export TINGLAN_PLAY_KEY_FILE="$(mktemp "$RUNNER_TEMP/tinglan-play.XXXXXX")"
+          trap 'rm -f "$TINGLAN_PLAY_KEY_FILE"' EXIT
+          printf '%s' "$PLAY_KEY_JSON" > "$TINGLAN_PLAY_KEY_FILE"
+          unset PLAY_KEY_JSON
+          bundle exec fastlane android upload_native_aab

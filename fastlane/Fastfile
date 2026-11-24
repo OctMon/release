@@ -396,6 +396,34 @@ platform :ios do
 end
 
 platform :android do
+  desc "Upload a prebuilt native Android AAB to internal testing"
+  lane :upload_native_aab do
+    require_relative "lib/native_android_release"
+    project = NativeAndroidRelease.project
+    version = Integer(ENV.fetch("VERSION_CODE"))
+    key_path = ENV.fetch("TINGLAN_PLAY_KEY_FILE")
+    UI.user_error!("Signed AAB not found") unless File.file?(project.fetch("bundle"))
+    UI.user_error!("Play service account credentials are unavailable") unless File.file?(key_path)
+
+    existing = google_play_track_version_codes(
+      package_name: project.fetch("package_name"), track: "internal", json_key: key_path
+    )
+    if existing.map(&:to_i).include?(version)
+      UI.user_error!("Version #{version} is already on the internal track. Use its existing AAB or dispatch a new build.")
+    end
+    upload_to_play_store(
+      package_name: project.fetch("package_name"),
+      track: "internal",
+      aab: project.fetch("bundle"),
+      json_key: key_path,
+      skip_upload_apk: true,
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true,
+      skip_upload_changelogs: true
+    )
+  end
+
   desc "Build the target Android APK and upload it to Pgyer"
   lane :release_beta do |options|
     setup_ci
