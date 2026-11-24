@@ -463,8 +463,8 @@ platform :android do
       upload_to_play_store(
         **upload_options,
         release_status: "draft",
-        changes_not_sent_for_review: true,
-        rescue_changes_not_sent_for_review: false
+        # Supply retries the same edit without the query parameter if Play rejects it.
+        rescue_changes_not_sent_for_review: true
       )
       message = "Google Play production versionCode #{version} was saved as a draft. Complete the first release submission in Play Console."
       UI.important(message)
