@@ -9,10 +9,10 @@ on:
         required: true
         default: tinglan
         options: [tinglan]
-      source_sha:
-        description: '所选项目 main 分支的完整提交 SHA'
-        required: true
+      branch:
+        description: '源码分支，留空使用项目默认分支'
         type: string
+        required: false
       upload_internal:
         description: Upload to Google Play internal testing after the initial manual upload
         default: false
@@ -46,11 +46,12 @@ jobs:
           ruby-version: '3.4'
           bundler-cache: true
 
-      - name: Checkout the requested source commit
+      - name: Checkout native app source
+        id: source
         env:
           TARGET_REPO: ${{ secrets[format('{0}_ANDROID_REPO', inputs.project)] }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
+          NATIVE_BRANCH: ${{ inputs.branch }}
         run: ruby -r ./fastlane/lib/native_android_release -e 'NativeAndroidRelease.checkout!'
 
       - name: Read the app release configuration
@@ -98,6 +99,8 @@ jobs:
           AAB: ${{ steps.config.outputs.bundle }}
           PACKAGE_NAME: ${{ steps.config.outputs.package_name }}
           BUNDLE_CHECK: ${{ steps.config.outputs.bundle_check }}
+          SOURCE_BRANCH: ${{ steps.source.outputs.branch }}
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
         run: |
           set -euo pipefail
           jarsigner -J-Duser.language=en -J-Duser.country=US -verify "$AAB" | grep -F 'jar verified.'
@@ -113,10 +116,9 @@ jobs:
           }
           test "$(manifest_value /manifest/@package)" = "$PACKAGE_NAME"
           test "$(manifest_value /manifest/@android:versionCode)" = "$VERSION_CODE"
-          revision="$(git -C "$TARGET_APP_DIR" rev-parse HEAD)"
           {
-            printf 'Package: %s\nVersion: %s (%s)\nCommit: %s\n' "$PACKAGE_NAME" \
-              "$(manifest_value /manifest/@android:versionName)" "$VERSION_CODE" "$revision"
+            printf 'Package: %s\nVersion: %s (%s)\nBranch: %s\nCommit: %s\n' "$PACKAGE_NAME" \
+              "$(manifest_value /manifest/@android:versionName)" "$VERSION_CODE" "$SOURCE_BRANCH" "$SOURCE_REVISION"
             printf 'AAB bytes: %s\n' "$(wc -c < "$AAB" | tr -d ' ')"
             printf 'AAB SHA-256: %s\n' "$(sha256sum "$AAB" | cut -d' ' -f1)"
           } | tee "$RUNNER_TEMP/native-android-release.txt" >> "$GITHUB_STEP_SUMMARY"

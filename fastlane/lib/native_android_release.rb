@@ -13,17 +13,36 @@ module NativeAndroidRelease
   module_function
 
   def checkout!
-    commit = ENV.fetch("SOURCE_SHA", "")
-    raise Error, "SOURCE_SHA must be a full commit SHA" unless commit.match?(/\A[0-9a-f]{40}\z/)
-
+    branch = requested_branch
+    branch_arguments = branch ? ["--branch", branch] : []
     target = File.expand_path(ENV.fetch("TARGET_APP_DIR"))
     repository = ENV.fetch("TARGET_REPO", "")
     with_source_ssh(repository) do |git_env|
-      git!(git_env, "clone", "--single-branch", "--branch", "main", "--", repository, target)
-      git!(git_env, "-C", target, "merge-base", "--is-ancestor", commit, "origin/main")
-      git!(git_env, "-C", target, "checkout", "--detach", commit)
+      git!(git_env, "clone", "--single-branch", *branch_arguments, "--", repository, target)
     end
-    puts "Source main @ #{commit}"
+
+    actual_ref = git!({}, "-C", target, "symbolic-ref", "--quiet", "HEAD")
+    raise Error, "The checked-out source is not a branch" unless actual_ref.start_with?("refs/heads/")
+
+    actual_branch = actual_ref.delete_prefix("refs/heads/")
+    raise Error, "The checked-out branch does not match the requested branch" if branch && branch != actual_branch
+
+    revision = git!({}, "-C", target, "rev-parse", "HEAD")
+    puts "Source #{actual_branch} @ #{revision}"
+    if ENV["GITHUB_OUTPUT"]
+      File.open(ENV.fetch("GITHUB_OUTPUT"), "a") { |file| file.puts("branch=#{actual_branch}", "revision=#{revision}") }
+    end
+  end
+
+  def requested_branch
+    branch = ENV["NATIVE_BRANCH"].to_s.strip
+    return nil if branch.empty?
+
+    unless branch.match?(%r{\A[a-zA-Z0-9][a-zA-Z0-9._/-]*\z}) && system("git", "check-ref-format", "refs/heads/#{branch}", out: File::NULL)
+      raise Error, "Invalid Android source branch"
+    end
+
+    branch
   end
 
   def with_source_ssh(repository)
@@ -47,9 +66,10 @@ module NativeAndroidRelease
   end
 
   def git!(environment, *arguments)
-    return if system(environment, "git", *arguments)
+    output, status = Open3.capture2(environment, "git", *arguments)
+    raise Error, "Unable to check out the Android source branch" unless status.success?
 
-    raise Error, "Unable to check out the requested commit from main"
+    output.strip
   end
 
   def project(root = ENV.fetch("TARGET_APP_DIR"))
