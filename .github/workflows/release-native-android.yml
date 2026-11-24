@@ -13,8 +13,8 @@ on:
         description: '源码分支，留空使用项目默认分支'
         type: string
         required: false
-      upload_internal:
-        description: '上传 AAB 到 Google Play 内部测试草稿（首次手动上传后使用）'
+      upload_production:
+        description: '上传 AAB 到 Google Play 正式轨道并自动送审'
         default: true
         type: boolean
 
@@ -132,8 +132,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload a draft to Google Play internal testing
-        if: inputs.upload_internal
+      - name: Upload to Google Play production
+        if: inputs.upload_production
         env:
           PLAY_KEY_JSON: ${{ secrets[format('{0}_PLAY_SERVICE_ACCOUNT_JSON', inputs.project)] }}
         run: |
