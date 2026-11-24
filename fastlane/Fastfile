@@ -6,6 +6,7 @@ require "json"
 require "net/http"
 require "securerandom"
 require "tempfile"
+require "timeout"
 require "uri"
 require_relative "lib/release_config"
 require_relative "lib/sdk_release"
@@ -395,37 +396,51 @@ platform :ios do
   end
 end
 
+def try_native_play_version_code(project, key_path: nil)
+  require "supply"
+  Timeout.timeout(30) do
+    key_path ||= NativeAndroidRelease.google_play_key_path(project)
+    client = Supply::Client.make_from_config(params: { json_key: key_path })
+    NativeAndroidRelease.latest_play_version_code(project.fetch("package_name"), client: client)
+  end
+rescue NativeAndroidRelease::Error, FastlaneCore::Interface::FastlaneError, Google::Apis::Error,
+       Signet::AuthorizationError, Faraday::Error, Timeout::Error => error
+  cause = error.cause || error
+  status = cause.status_code if cause.respond_to?(:status_code)
+  reason = status ? "HTTP #{status}" : cause.class.name
+  UI.important("Google Play version lookup unavailable for #{project.fetch('package_name')} (#{reason}). Continuing with the local version code.")
+  nil
+end
+
 platform :android do
   desc "Resolve the next native Android version code before packaging"
   lane :resolve_native_version_code do
     require_relative "lib/native_android_release"
     project = NativeAndroidRelease.project
     publish = ENV["UPLOAD_PRODUCTION"] == "true"
-    uploaded = 0
-    if publish
-      require "supply"
-      key_path = NativeAndroidRelease.google_play_key_path(project)
-      client = Supply::Client.make_from_config(params: { json_key: key_path })
-      uploaded = NativeAndroidRelease.latest_play_version_code(project.fetch("package_name"), client: client)
-    end
+    uploaded = try_native_play_version_code(project) if publish
+    lookup_unavailable = publish && uploaded.nil?
     current = NativeAndroidRelease.source_version_code(project)
-    version = NativeAndroidRelease.next_version_code(ENV.fetch("VERSION_CODE"), uploaded, current: current)
-    File.open(ENV.fetch("GITHUB_ENV"), "a") { |file| file.puts("VERSION_CODE=#{version}") }
-    UI.message("Android versionCode #{version} (source: #{current}, Google Play: #{publish ? uploaded : 'not queried'})")
+    version = NativeAndroidRelease.next_version_code(ENV.fetch("VERSION_CODE"), uploaded || 0, current: current)
+    File.open(ENV.fetch("GITHUB_ENV"), "a") do |file|
+      file.puts("VERSION_CODE=#{version}", "PLAY_VERSION_LOOKUP_UNAVAILABLE=#{lookup_unavailable}")
+    end
+    play_version = publish ? (uploaded || "unavailable") : "not queried"
+    UI.message("Android versionCode #{version} (source: #{current}, Google Play: #{play_version})")
   end
 
   desc "Upload a prebuilt native Android AAB to Google Play production"
   lane :upload_native_aab do
-    require "supply"
     require_relative "lib/native_android_release"
     project = NativeAndroidRelease.project
     version = Integer(ENV.fetch("VERSION_CODE"))
     key_path = NativeAndroidRelease.google_play_key_path(project)
     UI.user_error!("Signed AAB not found") unless File.file?(project.fetch("bundle"))
 
-    client = Supply::Client.make_from_config(params: { json_key: key_path })
-    uploaded = NativeAndroidRelease.latest_play_version_code(project.fetch("package_name"), client: client)
-    if version <= uploaded
+    unless ENV["PLAY_VERSION_LOOKUP_UNAVAILABLE"] == "true"
+      uploaded = try_native_play_version_code(project, key_path: key_path)
+    end
+    if uploaded && version <= uploaded
       UI.user_error!("Google Play has reached versionCode #{uploaded}. Dispatch a new build to allocate a higher code.")
     end
     upload_to_play_store(
