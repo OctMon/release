@@ -93,6 +93,10 @@ module NativeAndroidRelease
     if config.key?("version_code_property")
       version_code_property = config_value(config, "version_code_property", /\A[A-Za-z][A-Za-z0-9_.-]*\z/)
     end
+    google_play = config.fetch("google_play", {})
+    raise Error, "Invalid google_play configuration in #{CONFIG_PATH}" unless google_play.is_a?(Hash)
+
+    key_path = path_under(root, google_play.fetch("json_key_path")) if google_play.key?("json_key_path")
     {
       "project" => gradle_root,
       "package_name" => config_value(config, "package_name", /\A[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+\z/),
@@ -103,11 +107,19 @@ module NativeAndroidRelease
       "sdk_platform" => config_value(config, "sdk_platform", /\Aandroid-[0-9]+(?:\.[0-9]+)?(?:-ext[0-9]+)?\z/, "android-37.0"),
       "build_tools" => config_value(config, "build_tools", /\A[0-9]+\.[0-9]+\.[0-9]+\z/, "36.0.0"),
       "version_code_property" => version_code_property,
+      "google_play_key_path" => key_path,
       "catalog_check" => optional_check(root, "validate_catalog.py"),
       "bundle_check" => optional_check(root, "validate_bundle.py")
     }
   rescue Errno::ENOENT
     raise Error, "Android release configuration not found at #{CONFIG_PATH}"
+  end
+
+  def google_play_key_path(config)
+    path = config.fetch("google_play_key_path")
+    return path if path && File.file?(path)
+
+    raise Error, "Configure google_play.json_key_path in #{CONFIG_PATH} and include the service account JSON in the Android source checkout"
   end
 
   def config_value(config, key, pattern, default = nil)

@@ -88,14 +88,8 @@ jobs:
 
       - name: Resolve Android version code
         env:
-          PLAY_KEY_JSON: ${{ secrets[format('{0}_PLAY_SERVICE_ACCOUNT_JSON', inputs.project)] }}
           UPLOAD_PRODUCTION: ${{ inputs.upload_production }}
-        run: |
-          set -euo pipefail
-          if [[ "$UPLOAD_PRODUCTION" == true ]]; then
-            : "${PLAY_KEY_JSON:?Configure the Play service account secret for the selected project}"
-          fi
-          bundle exec fastlane android resolve_native_version_code
+        run: bundle exec fastlane android resolve_native_version_code
 
       - name: Commit the Android version code in the build checkout
         id: release_source
@@ -162,14 +156,4 @@ jobs:
 
       - name: Upload to Google Play production
         if: inputs.upload_production
-        env:
-          PLAY_KEY_JSON: ${{ secrets[format('{0}_PLAY_SERVICE_ACCOUNT_JSON', inputs.project)] }}
-        run: |
-          set -euo pipefail
-          : "${PLAY_KEY_JSON:?Configure the Play service account secret for the selected project}"
-          umask 077
-          export NATIVE_ANDROID_PLAY_KEY_FILE="$(mktemp "$RUNNER_TEMP/native-android-play.XXXXXX")"
-          trap 'rm -f "$NATIVE_ANDROID_PLAY_KEY_FILE"' EXIT
-          printf '%s' "$PLAY_KEY_JSON" > "$NATIVE_ANDROID_PLAY_KEY_FILE"
-          unset PLAY_KEY_JSON
-          bundle exec fastlane android upload_native_aab
+        run: bundle exec fastlane android upload_native_aab
