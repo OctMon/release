@@ -86,6 +86,24 @@ jobs:
           MODULE: ${{ steps.config.outputs.module }}
         run: ./gradlew "$MODULE:testDebugUnitTest" "$MODULE:lintRelease"
 
+      - name: Resolve Android version code
+        env:
+          PLAY_KEY_JSON: ${{ secrets[format('{0}_PLAY_SERVICE_ACCOUNT_JSON', inputs.project)] }}
+          UPLOAD_PRODUCTION: ${{ inputs.upload_production }}
+        run: |
+          set -euo pipefail
+          if [[ "$UPLOAD_PRODUCTION" == true ]]; then
+            : "${PLAY_KEY_JSON:?Configure the Play service account secret for the selected project}"
+          fi
+          bundle exec fastlane android resolve_native_version_code
+
+      - name: Commit the Android version code in the build checkout
+        id: release_source
+        if: inputs.upload_production
+        env:
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+        run: ruby -r ./fastlane/lib/native_android_release -e 'NativeAndroidRelease.commit_version_code!'
+
       - name: Build the signed Android App Bundle
         working-directory: ${{ steps.config.outputs.project }}
         env:
@@ -99,7 +117,7 @@ jobs:
           PACKAGE_NAME: ${{ steps.config.outputs.package_name }}
           BUNDLE_CHECK: ${{ steps.config.outputs.bundle_check }}
           SOURCE_BRANCH: ${{ steps.source.outputs.branch }}
-          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+          SOURCE_REVISION: ${{ steps.release_source.outputs.revision || steps.source.outputs.revision }}
         run: |
           set -euo pipefail
           jarsigner -J-Duser.language=en -J-Duser.country=US -verify "$AAB" | grep -F 'jar verified.'
@@ -131,6 +149,16 @@ jobs:
             ${{ runner.temp }}/native-android-release.txt
           if-no-files-found: error
           retention-days: 30
+
+      - name: Write Android version code back to the source branch
+        if: inputs.upload_production
+        env:
+          TARGET_REPO: ${{ secrets[format('{0}_ANDROID_REPO', inputs.project)] }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SOURCE_BRANCH: ${{ steps.source.outputs.branch }}
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+          RELEASE_REVISION: ${{ steps.release_source.outputs.revision }}
+        run: ruby -r ./fastlane/lib/native_android_release -e 'NativeAndroidRelease.push_version_code!'
 
       - name: Upload to Google Play production
         if: inputs.upload_production

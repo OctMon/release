@@ -396,25 +396,41 @@ platform :ios do
 end
 
 platform :android do
+  desc "Resolve the next native Android version code before packaging"
+  lane :resolve_native_version_code do
+    require_relative "lib/native_android_release"
+    project = NativeAndroidRelease.project
+    key = ENV.fetch("PLAY_KEY_JSON", "")
+    uploaded = 0
+    unless key.empty?
+      require "supply"
+      client = Supply::Client.make_from_config(params: { json_key_data: key })
+      uploaded = NativeAndroidRelease.latest_play_version_code(project.fetch("package_name"), client: client)
+    end
+    current = NativeAndroidRelease.source_version_code(project)
+    version = NativeAndroidRelease.next_version_code(ENV.fetch("VERSION_CODE"), uploaded, current: current)
+    File.open(ENV.fetch("GITHUB_ENV"), "a") { |file| file.puts("VERSION_CODE=#{version}") }
+    UI.message("Android versionCode #{version} (source: #{current}, Google Play: #{key.empty? ? 'not queried' : uploaded})")
+  end
+
   desc "Upload a prebuilt native Android AAB to Google Play production"
   lane :upload_native_aab do
+    require "supply"
     require_relative "lib/native_android_release"
     project = NativeAndroidRelease.project
     version = Integer(ENV.fetch("VERSION_CODE"))
     key_path = ENV.fetch("NATIVE_ANDROID_PLAY_KEY_FILE")
-    track = "production"
     UI.user_error!("Signed AAB not found") unless File.file?(project.fetch("bundle"))
     UI.user_error!("Play service account credentials are unavailable") unless File.file?(key_path)
 
-    existing = google_play_track_version_codes(
-      package_name: project.fetch("package_name"), track: track, json_key: key_path
-    )
-    if existing.map(&:to_i).include?(version)
-      UI.user_error!("Version #{version} is already on the production track. Use its existing AAB or dispatch a new build.")
+    client = Supply::Client.make_from_config(params: { json_key: key_path })
+    uploaded = NativeAndroidRelease.latest_play_version_code(project.fetch("package_name"), client: client)
+    if version <= uploaded
+      UI.user_error!("Google Play has reached versionCode #{uploaded}. Dispatch a new build to allocate a higher code.")
     end
     upload_to_play_store(
       package_name: project.fetch("package_name"),
-      track: track,
+      track: "production",
       aab: project.fetch("bundle"),
       json_key: key_path,
       skip_upload_apk: true,

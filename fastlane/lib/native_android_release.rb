@@ -9,6 +9,7 @@ module NativeAndroidRelease
   class Error < StandardError; end
 
   CONFIG_PATH = ".github/native-android.yml"
+  MAX_VERSION_CODE = 2_100_000_000
 
   module_function
 
@@ -21,10 +22,7 @@ module NativeAndroidRelease
       git!(git_env, "clone", "--single-branch", *branch_arguments, "--", repository, target)
     end
 
-    actual_ref = git!({}, "-C", target, "symbolic-ref", "--quiet", "HEAD")
-    raise Error, "The checked-out source is not a branch" unless actual_ref.start_with?("refs/heads/")
-
-    actual_branch = actual_ref.delete_prefix("refs/heads/")
+    actual_branch = source_branch(target)
     raise Error, "The checked-out branch does not match the requested branch" if branch && branch != actual_branch
 
     revision = git!({}, "-C", target, "rev-parse", "HEAD")
@@ -32,6 +30,13 @@ module NativeAndroidRelease
     if ENV["GITHUB_OUTPUT"]
       File.open(ENV.fetch("GITHUB_OUTPUT"), "a") { |file| file.puts("branch=#{actual_branch}", "revision=#{revision}") }
     end
+  end
+
+  def source_branch(target)
+    ref = git!({}, "-C", target, "symbolic-ref", "--quiet", "HEAD")
+    raise Error, "The checked-out source is not a branch" unless ref.start_with?("refs/heads/")
+
+    ref.delete_prefix("refs/heads/")
   end
 
   def requested_branch
@@ -65,9 +70,9 @@ module NativeAndroidRelease
     end
   end
 
-  def git!(environment, *arguments)
+  def git!(environment, *arguments, error: "Git failed during the Android release")
     output, status = Open3.capture2(environment, "git", *arguments)
-    raise Error, "Unable to check out the Android source branch" unless status.success?
+    raise Error, error unless status.success?
 
     output.strip
   end
@@ -117,6 +122,111 @@ module NativeAndroidRelease
     File.file?(path) ? path : ""
   end
 
+  def latest_play_version_code(package_name, client:)
+    client.begin_edit(package_name: package_name)
+    begin
+      track_codes = client.tracks.flat_map do |track|
+        Array(track.releases).flat_map { |release| Array(release.version_codes) }
+      end
+      (track_codes + client.aab_version_codes + client.apks_version_codes).map { |code| Integer(code) }.max || 0
+    ensure
+      client.abort_current_edit
+    end
+  end
+
+  def next_version_code(run_number, uploaded, current: 1)
+    baseline = Integer(run_number)
+    version = [baseline, current, uploaded + 1].max
+    unless baseline.positive? && version <= MAX_VERSION_CODE
+      raise Error, "Android versionCode must be in 1..#{MAX_VERSION_CODE}"
+    end
+
+    version
+  end
+
+  def version_code_property(config)
+    project_id = ENV.fetch("NATIVE_ANDROID_PROJECT", "")
+    raise Error, "Invalid Android project name" unless /\A[a-z][a-z0-9_]*\z/.match?(project_id)
+
+    config["version_code_property"] || "#{project_id}VersionCode"
+  end
+
+  def gradle_version_setting(config)
+    path = File.join(config.fetch("project"), "gradle.properties")
+    raise Error, "gradle.properties must be a regular file" if File.symlink?(path)
+
+    contents = File.exist?(path) ? File.binread(path) : ""
+    property = Regexp.escape(version_code_property(config))
+    pattern = /^([ \t]*#{property}(?:[ \t]*[=:][ \t]*|[ \t]+))([^\r\n]*?)([ \t]*)(?=\r?$)/
+    entries = contents.scan(pattern)
+    value = entries.empty? ? "1" : entries.fetch(0).fetch(1)
+    current = value.to_i
+    unless entries.size <= 1 && /\A[1-9][0-9]*\z/.match?(value) && current <= MAX_VERSION_CODE
+      raise Error, "gradle.properties must define at most one valid Android versionCode"
+    end
+
+    [path, contents, pattern, current]
+  end
+
+  def source_version_code(config)
+    gradle_version_setting(config).last
+  end
+
+  def commit_version_code!
+    target = File.realpath(ENV.fetch("TARGET_APP_DIR"))
+    source = git!({}, "-C", target, "rev-parse", "HEAD")
+    raise Error, "Android source checkout changed before the build" unless source == ENV.fetch("SOURCE_REVISION")
+
+    config = project(target)
+    path, contents, pattern, current = gradle_version_setting(config)
+    version = Integer(ENV.fetch("VERSION_CODE"))
+    unless (current..MAX_VERSION_CODE).cover?(version)
+      raise Error, "Android versionCode cannot go below the source build number or exceed #{MAX_VERSION_CODE}"
+    end
+
+    updated = if contents.match?(pattern)
+                contents.sub(pattern) { "#{Regexp.last_match(1)}#{version}#{Regexp.last_match(3)}" }
+              else
+                newline = contents.include?("\r\n") ? "\r\n" : "\n"
+                separator = contents.empty? || contents.end_with?("\n") ? "" : newline
+                "#{contents}#{separator}#{version_code_property(config)}=#{version}#{newline}"
+              end
+    if updated != contents
+      File.binwrite(path, updated)
+      git!({}, "-C", target, "add", "--", path)
+      git!({}, "-C", target, "-c", "user.name=github-actions[bot]",
+           "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+           "commit", "-m", "release: Android versionCode #{version}", "--", path)
+    end
+
+    revision = git!({}, "-C", target, "rev-parse", "HEAD")
+    File.open(ENV.fetch("GITHUB_OUTPUT"), "a") { |file| file.puts("revision=#{revision}") }
+  end
+
+  def push_version_code!
+    target = File.realpath(ENV.fetch("TARGET_APP_DIR"))
+    branch = ENV.fetch("SOURCE_BRANCH")
+    source = ENV.fetch("SOURCE_REVISION")
+    release = ENV.fetch("RELEASE_REVISION")
+    unless source_branch(target) == branch && git!({}, "-C", target, "rev-parse", "HEAD") == release
+      raise Error, "The Android checkout does not match the packaged release"
+    end
+
+    repository = ENV.fetch("TARGET_REPO")
+    ref = "refs/heads/#{branch}"
+    with_source_ssh(repository) do |git_env|
+      remote = git!(git_env, "ls-remote", "--exit-code", "--refs", repository, ref,
+                    error: "Unable to read the Android source branch").split.first
+      unless remote == release
+        raise Error, "Android source branch advanced during the build. Dispatch a new release." unless remote == source
+
+        git!(git_env, "-C", target, "push", repository, "#{release}:#{ref}",
+             error: "Unable to write back versionCode. Check Android source branch write access or dispatch a new release.")
+      end
+    end
+    puts "Android versionCode written back to #{branch} @ #{release}"
+  end
+
   def path_under(root, relative)
     unless relative.is_a?(String) && relative.match?(%r{\A[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\z}) &&
            relative.split("/").none? { |part| part == "." || part == ".." }
@@ -127,10 +237,7 @@ module NativeAndroidRelease
 
   def describe!
     config = project
-    project_id = ENV.fetch("NATIVE_ANDROID_PROJECT", "")
-    raise Error, "Invalid Android project name" unless /\A[a-z][a-z0-9_]*\z/.match?(project_id)
-
-    config["version_code_property"] ||= "#{project_id}VersionCode"
+    config["version_code_property"] = version_code_property(config)
     File.open(ENV.fetch("GITHUB_OUTPUT"), "a") do |file|
       config.each { |key, value| file.puts("#{key}=#{value}") }
     end
