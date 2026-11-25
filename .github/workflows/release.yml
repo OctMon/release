@@ -234,6 +234,7 @@ jobs:
           FLUTTER_STORAGE_BASE_URL: https://storage.flutter-io.cn
 
       - name: Build IPA and upload TestFlight
+        id: testflight
         if: ${{ github.event.inputs.upload_testflight == 'true' && steps.release_mode.outputs.centralized == 'true' }}
         working-directory: ${{ env.RELEASE_TOOLS_DIR }}
         run: |
@@ -322,6 +323,7 @@ jobs:
         env:
           JOB_STATUS: ${{ job.status }}
           GITHUB_ACTOR: ${{ github.actor }}
+          TESTFLIGHT_EXTERNAL_REVIEW_DEFERRED: ${{ steps.testflight.outputs.external_review_deferred }}
           TESTFLIGHT_FAILURE_PATH: ${{ runner.temp }}/testflight-failure-${{ github.run_id }}-${{ github.run_attempt }}.json
 
       - name: Notify Feishu with legacy project lane

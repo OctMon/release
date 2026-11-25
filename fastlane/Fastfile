@@ -388,6 +388,14 @@ platform :ios do
       end
       begin
         upload_to_testflight(**upload_options)
+      rescue Spaceship::UnexpectedResponse => e
+        raise unless upload_options[:distribute_external] && e.message.lines.one? &&
+                     e.message.start_with?("Another build is in review. - Another build in the same train is already in beta review.")
+
+        UI.important("IPA 已上传到 TestFlight。同一版本已有其他构建在审核，请在审核结束后提交本次构建进行外部测试。")
+        if ENV["GITHUB_OUTPUT"]
+          File.open(ENV.fetch("GITHUB_OUTPUT"), "a") { |file| file.puts("external_review_deferred=true") }
+        end
       rescue Spaceship::ProgramLicenseAgreementUpdated => e
         record_testflight_failure(e)
         raise
@@ -592,7 +600,9 @@ lane :notify_feishu do |options|
   success = job_status == "success"
 
   testflight_error = testflight_failure_summary if job_status == "failure"
-  text = if success
+  text = if success && ENV["TESTFLIGHT_EXTERNAL_REVIEW_DEFERRED"] == "true"
+           "✅ 打包上传成功。TestFlight 同一版本已有构建在审核，本次构建待提交外部测试审核。"
+         elsif success
            "✅ 打包上传成功，快去体验吧！🚀"
          elsif testflight_error
            "❌ 上传 TestFlight 失败"
