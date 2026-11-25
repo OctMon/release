@@ -161,7 +161,7 @@ module NativeIOSRelease
   end
 
   def with_source_ssh
-    label = "源码仓库 Secret #{project_key.upcase}"
+    label = "源码仓库 Secret #{project_key.upcase}_IOS_REPO"
     repo = ENV["TARGET_REPO"].to_s.strip
     raise Error, "缺少#{label}" if repo.empty?
 

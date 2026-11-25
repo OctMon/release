@@ -67,7 +67,7 @@ jobs:
       - name: Checkout native app source
         run: bundle exec ruby -r ./fastlane/lib/native_ios_release -e 'NativeIOSRelease.checkout!'
         env:
-          TARGET_REPO: ${{ secrets[inputs.project] }}
+          TARGET_REPO: ${{ secrets[format('{0}_IOS_REPO', inputs.project)] }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
       - name: Build and verify signed IPA
@@ -92,7 +92,7 @@ jobs:
         id: writeback
         run: bundle exec ruby -r ./fastlane/lib/native_ios_release -e 'NativeIOSRelease.push_version!'
         env:
-          TARGET_REPO: ${{ secrets[inputs.project] }}
+          TARGET_REPO: ${{ secrets[format('{0}_IOS_REPO', inputs.project)] }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
       - name: Upload IPA and wait for Apple processing
