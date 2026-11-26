@@ -218,6 +218,8 @@ platform :ios do
         scheme: config.fetch("scheme"),
         configuration: "Release",
         destination: "generic/platform=iOS",
+        # CI cannot approve package macros interactively; trust the checked-out dependencies.
+        xcargs: "-skipMacroValidation",
         archive_path: File.join(NativeIOSRelease.required("RUNNER_TEMP"), "native-ios.xcarchive"),
         derived_data_path: File.join(NativeIOSRelease.required("RUNNER_TEMP"), "native-ios-derived-data"),
         output_directory: NativeIOSRelease.output_dir,
