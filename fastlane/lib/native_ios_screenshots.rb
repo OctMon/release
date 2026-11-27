@@ -353,19 +353,31 @@ module NativeIOSScreenshots
     logged!(log, "读取模拟器运行时", "xcrun", "simctl", "list", "runtimes")
     logged!(log, "单图验证 1/2 · 启动 iPhone 模拟器", "xcrun", "simctl", "bootstatus", id, "-b", timeout: 240)
     system_png = File.join(work, "simulator-home.png")
-    logged!(log, "单图验证 1/2 · 截取模拟器屏幕", "xcrun", "simctl", "io", id, "screenshot", system_png, timeout: 30)
-    validate_raw_png!(system_png, device.fetch(:size), "模拟器屏幕")
+    system_error = nil
+    begin
+      logged!(log, "单图验证 1/2 · 截取模拟器屏幕", "xcrun", "simctl", "io", id, "screenshot", system_png, timeout: 30)
+      validate_raw_png!(system_png, device.fetch(:size), "模拟器屏幕")
+    rescue Release::Error => e
+      system_error = e
+      FileUtils.rm_f(system_png)
+      File.open(log, "a", 0o600) { |stream| stream.puts(e.message) }
+      progress("#{e.message}，继续验证 Fastlane 截图")
+    end
 
     progress("单图验证 2/2 · 使用 Fastlane snapshot 拍听澜首页")
     raw = File.join(work, "probe")
     capture_snapshot!(work, log, project, scheme, device, simulator, raw, probe: true)
     app_png = File.join(raw, "zh-Hans", "01-five-tones.png")
     zip = File.join(work, "screenshot-probe.zip")
-    Release.encrypt_zip!(zip, password, system_png, app_png)
+    images = system_error ? [app_png] : [system_png, app_png]
+    Release.encrypt_zip!(zip, password, *images)
     File.chmod(0o600, zip)
     output = File.join(destination, File.basename(zip))
     File.rename(zip, output)
     Release.outputs(zip_path: output, artifact_name: "screenshot-probe")
+    if system_error
+      raise Release::Error, "系统截图失败，Fastlane 单图通过，已打包听澜首页。#{system_error.message}"
+    end
     progress("单图验证通过，已打包两张加密验证图")
   end
 
