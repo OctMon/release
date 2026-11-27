@@ -11,10 +11,11 @@ class NativeIOSScreenshotsTest < Minitest::Test
       log = File.join(directory, "capture.log")
       stdout, = capture_io do
         Screenshots.logged!(log, "测试阶段", RbConfig.ruby, "-e",
-                            %q(puts "private fixture"; puts "snapshot: en-US_02-listening"))
+                            %q(puts "Failed to launch the test runner: private fixture"; puts "snapshot: en-US_02-listening"))
       end
       assert_includes stdout, "开始 测试阶段"
       assert_includes stdout, "开始拍摄 en-US / 02-listening"
+      assert_includes stdout, "应用或测试运行器启动失败"
       assert_includes stdout, "完成 测试阶段"
       refute_includes stdout, "private fixture"
       assert_includes File.read(log), "private fixture"

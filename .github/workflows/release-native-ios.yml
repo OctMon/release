@@ -225,6 +225,16 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Upload encrypted screenshot diagnostics
+        if: ${{ failure() && steps.capture.outputs.diagnostics_zip_path != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshot-diagnostics-${{ github.run_attempt }}
+          path: ${{ steps.capture.outputs.diagnostics_zip_path }}
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
   summary:
     name: Summarize selected actions
     if: ${{ always() }}

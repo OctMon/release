@@ -18,6 +18,14 @@ module NativeIOSScreenshots
     /SwiftCompile |SwiftDriver |CompileSwift/ => "正在编译 Swift",
     /LinkStoryboards |CopySwiftLibs |WriteAuxiliaryFile / => "正在处理构建产物"
   }.freeze
+  TEST_PROGRESS = {
+    /Unable to boot|Failed to boot|failed to start the simulator/i => "模拟器启动失败",
+    /Failed to (?:install|launch) (?:the )?(?:app|application|test runner)|Early unexpected exit/i => "应用或测试运行器启动失败",
+    /Failed to establish communication|Failed to connect to the test|Lost connection to the test|test runner.*timed out/i => "与 XCTest 运行器的连接失败",
+    /Test Case .* failed|error: .*XCTAssert|error: .*XCTUnwrap/i => "XCTest 用例失败",
+    /\*\* TEST FAILED \*\*/ => "xcodebuild 报告测试失败",
+    /Test Case .* started/ => "XCTest 已进入截图用例"
+  }.freeze
   DEVICES = [
     { key: "iphone", types: [/\AiPhone-17-Pro-Max\z/, /\AiPhone-18-Pro-Max\z/],
       test: "testCaptureLocalizedStoreScreenshots", size: [1320, 2868], output: "screenshots" },
@@ -74,8 +82,11 @@ module NativeIOSScreenshots
     return "开始拍摄 #{shot[1]} / #{shot[2]}" if shot
 
     return "启动截图 UI 测试" if line.include?("Running snapshot on:")
+    exit_code = line[/Caught error\.\.\. (\d{1,3})\b/i, 1]
+    return "xcodebuild 返回退出码 #{exit_code}" if exit_code
 
-    BUILD_PROGRESS.find { |pattern, _| pattern.match?(line) }&.last
+    TEST_PROGRESS.find { |pattern, _| pattern.match?(line) }&.last ||
+      BUILD_PROGRESS.find { |pattern, _| pattern.match?(line) }&.last
   end
 
   def logged!(log, stage, *command, timeout: 60, heartbeat: 30, chdir: nil, &on_tick)
@@ -94,7 +105,7 @@ module NativeIOSScreenshots
             stream.puts(line)
             message = public_progress(line.scrub)
             next unless message
-            next if reported[message] && BUILD_PROGRESS.value?(message)
+            next if reported[message] && (BUILD_PROGRESS.value?(message) || TEST_PROGRESS.value?(message))
 
             reported[message] = true
             progress("#{stage} · #{message}")
@@ -303,6 +314,26 @@ module NativeIOSScreenshots
     end
   end
 
+  def save_diagnostics!(work, log, destination, password, error)
+    diagnostic = Dir.mktmpdir("diagnostics-", destination)
+    File.open(log, "a", 0o600) { |stream| stream.puts("#{error.class}: #{error.message}") }
+    diagnostics = [log, *Dir.glob(File.join(work, "*.xcresult")),
+                   *Dir.glob(File.join(work, "snapshot-*", "{logs,test_output}"))]
+    diagnostics.each do |file|
+      name = file.delete_prefix("#{work}/").tr("/", "-")
+      File.rename(file, File.join(diagnostic, name))
+    end
+    zip = File.join(work, "screenshot-diagnostics.zip")
+    Release.encrypt_zip!(zip, password, diagnostic)
+    File.chmod(0o600, zip)
+    output = File.join(destination, File.basename(zip))
+    File.rename(zip, output)
+    Release.outputs(diagnostics_zip_path: output)
+    progress("已打包加密诊断日志")
+  rescue StandardError
+    progress("加密诊断日志打包失败")
+  end
+
   def run!
     previous_umask = File.umask(0o077)
     password = Release.archive_password!
@@ -349,15 +380,7 @@ module NativeIOSScreenshots
         progress("加密 ZIP 校验完成，交给 Actions 上传")
         raise Release::Error, "#{duo_error.message}。已生成加密的 iPhone/iPad 截图 ZIP" if duo_error
       rescue StandardError => e
-        diagnostic = Dir.mktmpdir("diagnostics-", destination)
-        File.open(log, "a", 0o600) { |stream| stream.puts("#{e.class}: #{e.message}") }
-        diagnostics = Dir.glob(File.join(work, "*.xcresult")) +
-                      Dir.glob(File.join(work, "snapshot-*", "{logs,test_output}"))
-        diagnostics.each do |file|
-          name = file.delete_prefix("#{work}/").tr("/", "-")
-          File.rename(file, File.join(diagnostic, name))
-        end
-        File.rename(log, File.join(diagnostic, File.basename(log)))
+        save_diagnostics!(work, log, destination, password, e)
         reason = e.is_a?(Release::Error) ? e.message : "商店截图处理失败"
         raise Release::Error, reason, cause: nil
       end
