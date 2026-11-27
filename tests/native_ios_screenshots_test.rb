@@ -74,6 +74,22 @@ class NativeIOSScreenshotsTest < Minitest::Test
     assert_nil Screenshots.select_simulator(duo, inventory)
   end
 
+  def test_single_image_probe_imports_only_the_requested_frame
+    Dir.mktmpdir do |directory|
+      output = File.join(directory, "zh-Hans")
+      FileUtils.mkdir_p(output)
+      size = [1320, 2868]
+      png = "\x89PNG\r\n\x1a\n".b + [13, "IHDR", *size].pack("Na4NN")
+      File.binwrite(File.join(output, "iPhone 17 Pro Max-zh-Hans_01-five-tones.png"), png)
+
+      raw = File.join(directory, "raw")
+      Screenshots.import_snapshot!(directory, raw, "iPhone 17 Pro Max", size,
+                                   languages: ["zh-Hans"], pages: ["01-five-tones"])
+      assert_equal ["zh-Hans/01-five-tones.png"], Dir.glob("*/*.png", base: raw)
+      assert_equal png, File.binread(File.join(raw, "zh-Hans", "01-five-tones.png"))
+    end
+  end
+
   def test_duo_shot_acknowledges_supervised_capture_at_native_dimensions
     Dir.mktmpdir do |directory|
       log = File.join(directory, "capture.log")

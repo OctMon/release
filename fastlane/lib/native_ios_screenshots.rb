@@ -193,10 +193,13 @@ module NativeIOSScreenshots
     cleanup_simulator(log, "关闭 #{key}", "shutdown", id) if booted_here
   end
 
-  def capture_snapshot!(work, log, project, scheme, device, simulator, raw)
+  def capture_snapshot!(work, log, project, scheme, device, simulator, raw, probe: false)
     key = device.fetch(:key)
     name = simulator.fetch("name")
     output = File.join(work, "snapshot-#{key}")
+    languages = probe ? ["zh-Hans"] : LANGUAGES
+    pages = probe ? ["01-five-tones"] : RAW_PAGES
+    test = probe ? "testCaptureSnapshotHomeProbe" : device.fetch(:test)
     env = {
       "BUNDLE_GEMFILE" => File.expand_path("../../Gemfile", __dir__),
       "FASTLANE_OPT_OUT_USAGE" => "true",
@@ -208,14 +211,14 @@ module NativeIOSScreenshots
     logged!(log, "snapshot 采集 #{key}", env, "bundle", "exec", "fastlane", "snapshot",
             "--project", project, "--scheme", scheme, "--derived_data_path", File.join(work, "derived-data"),
             "--configuration", "Debug", "--devices", name, "--ios_version", "27.2",
-            "--languages", LANGUAGES.join(","), "--only_testing", "TinglanUITests/PadUITests/#{device.fetch(:test)}",
+            "--languages", languages.join(","), "--only_testing", "TinglanUITests/PadUITests/#{test}",
             "--xcargs=-parallel-testing-enabled NO -test-timeouts-enabled YES -maximum-test-execution-time-allowance 180 -skipMacroValidation CODE_SIGNING_ALLOWED=NO",
             "--output_directory", output, "--buildlog_path", File.join(output, "logs"),
             "--headless", "--skip_open_summary", "--result_bundle",
             "--override_status_bar", "false",
             "--number_of_retries", "0", "--stop_after_first_error", "--disable_xcpretty",
-            chdir: Release.source_dir, timeout: 900)
-    import_snapshot!(output, raw, name, device.fetch(:size))
+            chdir: Release.source_dir, timeout: probe ? 600 : 900)
+    import_snapshot!(output, raw, name, device.fetch(:size), languages: languages, pages: pages)
   end
 
   def capture_duo!(work, log, id, raw, size, test_command)
@@ -276,8 +279,8 @@ module NativeIOSScreenshots
     progress(e.message)
   end
 
-  def import_snapshot!(output, raw, name, size)
-    LANGUAGES.product(RAW_PAGES).each do |language, page|
+  def import_snapshot!(output, raw, name, size, languages: LANGUAGES, pages: RAW_PAGES)
+    languages.product(pages).each do |language, page|
       png = File.join(output, language, "#{name}-#{language}_#{page}.png")
       raise Release::Error, "snapshot 缺少 #{language}/#{page}" unless File.file?(png)
       validate_raw_png!(png, size, "snapshot #{language}/#{page}")
@@ -326,7 +329,7 @@ module NativeIOSScreenshots
   def save_diagnostics!(work, log, destination, password, error)
     diagnostic = Dir.mktmpdir("diagnostics-", destination)
     File.open(log, "a", 0o600) { |stream| stream.puts("#{error.class}: #{error.message}") }
-    diagnostics = [log, *Dir.glob(File.join(work, "*.xcresult")),
+    diagnostics = [log, *Dir.glob(File.join(work, "simulator-home.png")), *Dir.glob(File.join(work, "*.xcresult")),
                    *Dir.glob(File.join(work, "snapshot-*", "{logs,test_output}"))]
     diagnostics.each do |file|
       name = file.delete_prefix("#{work}/").tr("/", "-")
@@ -343,6 +346,29 @@ module NativeIOSScreenshots
     progress("加密诊断日志打包失败")
   end
 
+  def capture_probe!(work, log, project, scheme, simulator, destination, password)
+    device = DEVICES.first
+    id = simulator.fetch("udid")
+    progress("Runner 镜像 #{ENV.fetch('ImageOS', '未报告')} / #{ENV.fetch('ImageVersion', '未报告')}")
+    logged!(log, "读取模拟器运行时", "xcrun", "simctl", "list", "runtimes")
+    logged!(log, "单图验证 1/2 · 启动 iPhone 模拟器", "xcrun", "simctl", "bootstatus", id, "-b", timeout: 240)
+    system_png = File.join(work, "simulator-home.png")
+    logged!(log, "单图验证 1/2 · 截取模拟器屏幕", "xcrun", "simctl", "io", id, "screenshot", system_png, timeout: 30)
+    validate_raw_png!(system_png, device.fetch(:size), "模拟器屏幕")
+
+    progress("单图验证 2/2 · 使用 Fastlane snapshot 拍听澜首页")
+    raw = File.join(work, "probe")
+    capture_snapshot!(work, log, project, scheme, device, simulator, raw, probe: true)
+    app_png = File.join(raw, "zh-Hans", "01-five-tones.png")
+    zip = File.join(work, "screenshot-probe.zip")
+    Release.encrypt_zip!(zip, password, system_png, app_png)
+    File.chmod(0o600, zip)
+    output = File.join(destination, File.basename(zip))
+    File.rename(zip, output)
+    Release.outputs(zip_path: output, artifact_name: "screenshot-probe")
+    progress("单图验证通过，已打包两张加密验证图")
+  end
+
   def run!
     previous_umask = File.umask(0o077)
     password = Release.archive_password!
@@ -356,6 +382,10 @@ module NativeIOSScreenshots
         scheme = config.fetch("scheme")
         progress("读取 iOS 27.2 模拟器清单")
         devices = JSON.parse(Release.capture!("xcrun", "simctl", "list", "devices", "available", "-j")).fetch("devices")
+        if ENV["NATIVE_SCREENSHOT_PROBE"] == "true"
+          simulator = simulator_for!(DEVICES.first, devices)
+          return capture_probe!(work, log, project, scheme, simulator, destination, password)
+        end
         captured = []
         duo_error = nil
         DEVICES.each do |device|
