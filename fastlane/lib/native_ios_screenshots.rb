@@ -386,41 +386,32 @@ module NativeIOSScreenshots
           simulator = simulator_for!(DEVICES.first, devices)
           return capture_probe!(work, log, project, scheme, simulator, destination, password)
         end
-        captured = []
-        duo_error = nil
-        DEVICES.each do |device|
-          begin
-            progress("准备 #{device.fetch(:key)} 模拟器")
-            simulator = simulator_for!(device, devices)
-            capture_device!(work, log, project, scheme, device, simulator)
-            captured << device
-          rescue Release::Error => e
-            raise unless device.fetch(:key) == "duo"
-
-            duo_error = e
-            progress("#{e.message}，继续打包已完成的 iPhone 和 iPad")
-          end
+        duo_only = ENV["NATIVE_SCREENSHOT_TARGET"] == "duo"
+        selected = DEVICES.select { |device| (device.fetch(:key) == "duo") == duo_only }
+        selected.each do |device|
+          progress("准备 #{device.fetch(:key)} 模拟器")
+          simulator = simulator_for!(device, devices)
+          capture_device!(work, log, project, scheme, device, simulator)
         end
         rendered = File.join(work, "app-store-screenshots")
         logged!(log, "渲染商店截图", "swift", File.join(Release.source_dir, "Scripts", "RenderStorePreview.swift"),
-                duo_error ? "--store" : "--store-all", File.join(work, "raw"), rendered, timeout: 120)
+                duo_only ? "--store-duo" : "--store", File.join(work, "raw"), rendered, timeout: 120)
         progress("校验成品尺寸、张数和 PNG 格式")
-        validate_output!(rendered, devices: captured)
-        zip = File.join(work, "app-store-screenshots.zip")
+        validate_output!(rendered, devices: selected)
+        artifact_name = duo_only ? "app-store-screenshots-duo" : "app-store-screenshots-iphone-ipad"
+        zip = File.join(work, "#{artifact_name}.zip")
         Release.encrypt_zip!(zip, password, rendered) { |message| progress(message) }
         File.chmod(0o600, zip)
         output = File.join(destination, File.basename(zip))
         File.rename(zip, output)
-        Release.outputs(zip_path: output, artifact_name: duo_error ? "app-store-screenshots-iphone-ipad" : "app-store-screenshots")
-        progress("加密 ZIP 校验完成，交给 Actions 上传")
-        raise Release::Error, "#{duo_error.message}。已生成加密的 iPhone/iPad 截图 ZIP" if duo_error
+        Release.outputs(zip_path: output, artifact_name: artifact_name)
+        progress("#{selected.size * LANGUAGES.size * PAGES.size} 张商店截图已打包为加密 ZIP，交给 Actions 上传")
       rescue StandardError => e
         save_diagnostics!(work, log, destination, password, e)
         reason = e.is_a?(Release::Error) ? e.message : "商店截图处理失败"
         raise Release::Error, reason, cause: nil
       end
     end
-    puts "45 张商店截图已打包为加密 ZIP"
   ensure
     File.umask(previous_umask) if previous_umask
   end

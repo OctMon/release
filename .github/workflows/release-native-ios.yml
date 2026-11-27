@@ -17,7 +17,11 @@ on:
         type: boolean
         default: true
       generate_screenshots:
-        description: '生成 App Store 商店截图'
+        description: '生成 iPhone 和 iPad 商店截图'
+        type: boolean
+        default: false
+      generate_duo_screenshots:
+        description: '生成 iPhone Duo 内屏商店截图'
         type: boolean
         default: false
       screenshot_probe:
@@ -65,7 +69,7 @@ jobs:
           NATIVE_PROJECT: ${{ inputs.project }}
           NATIVE_BRANCH: ${{ inputs.branch }}
           NATIVE_RUN_RELEASE: ${{ inputs.build_and_upload && !inputs.screenshot_probe }}
-          NATIVE_RUN_SCREENSHOTS: ${{ inputs.generate_screenshots || inputs.screenshot_probe }}
+          NATIVE_RUN_SCREENSHOTS: ${{ inputs.generate_screenshots || inputs.generate_duo_screenshots || inputs.screenshot_probe }}
           TARGET_REPO: ${{ secrets[format('{0}_IOS_REPO', inputs.project)] }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
@@ -178,9 +182,13 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   screenshots:
-    name: Generate App Store screenshots
+    name: ${{ matrix.target == 'duo' && 'Generate iPhone Duo screenshots' || (inputs.screenshot_probe && 'Verify iPhone screenshot capture' || 'Generate iPhone and iPad screenshots') }}
     needs: prepare
-    if: ${{ inputs.generate_screenshots || inputs.screenshot_probe }}
+    if: ${{ inputs.generate_screenshots || inputs.generate_duo_screenshots || inputs.screenshot_probe }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON((inputs.generate_screenshots || inputs.screenshot_probe) && inputs.generate_duo_screenshots && '["standard","duo"]' || (inputs.generate_duo_screenshots && '["duo"]' || '["standard"]')) }}
     runs-on: xcode-27
     timeout-minutes: 60
     env:
@@ -218,7 +226,8 @@ jobs:
         run: ruby -r ./fastlane/lib/native_ios_release -e 'NativeIOSRelease.capture_store_screenshots!'
         env:
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
-          NATIVE_SCREENSHOT_PROBE: ${{ inputs.screenshot_probe }}
+          NATIVE_SCREENSHOT_PROBE: ${{ matrix.target == 'standard' && inputs.screenshot_probe }}
+          NATIVE_SCREENSHOT_TARGET: ${{ matrix.target }}
 
       - name: Upload encrypted screenshot ZIP
         if: ${{ !cancelled() && steps.capture.outputs.zip_path != '' }}
@@ -234,7 +243,7 @@ jobs:
         if: ${{ failure() && steps.capture.outputs.diagnostics_zip_path != '' }}
         uses: actions/upload-artifact@v4
         with:
-          name: screenshot-diagnostics-${{ github.run_attempt }}
+          name: screenshot-diagnostics-${{ matrix.target }}-${{ github.run_attempt }}
           path: ${{ steps.capture.outputs.diagnostics_zip_path }}
           include-hidden-files: true
           if-no-files-found: error
