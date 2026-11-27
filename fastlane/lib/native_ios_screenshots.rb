@@ -114,41 +114,9 @@ module NativeIOSScreenshots
     end
   end
 
-  def archive_password!(env: ENV)
-    password = env["MATCH_PASSWORD"].to_s
-    if password.strip.empty? || password.bytesize > 255 || password.match?(/[\0\r\n]/)
-      raise Release::Error, "截图 ZIP 需要配置非空、单行且不超过 255 字节的 MATCH_PASSWORD"
-    end
-
-    password
-  end
-
-  def archive_command(password, *arguments)
-    # Without a controlling terminal macOS bsdtar reads its prompt from stdin.
-    IO.pipe do |input, writer|
-      writer.write("#{password}\n")
-      writer.close
-      pid = Process.fork do
-        Process.setsid
-        exec({ "MATCH_PASSWORD" => nil }, "/usr/bin/tar", *arguments, in: input, out: File::NULL, err: File::NULL)
-      end
-      Process.wait2(pid).last.success?
-    end
-  end
-
-  def encrypt_zip!(rendered, zip, password)
-    unless archive_command(password, "-a", "-cf", zip, "--options", "zip:encryption=aes256", "--no-mac-metadata",
-                           "-C", File.dirname(rendered), File.basename(rendered))
-      raise Release::Error, "无法生成 AES-256 截图 ZIP"
-    end
-    unless archive_command(password, "-xOf", zip)
-      raise Release::Error, "无法用 MATCH_PASSWORD 解密截图 ZIP"
-    end
-  end
-
   def run!
     previous_umask = File.umask(0o077)
-    password = archive_password!
+    password = Release.archive_password!
     ENV.delete("MATCH_PASSWORD")
     destination = Release.private_artifact_dir("screenshots")
     Dir.mktmpdir(".capture-", destination) do |work|
@@ -171,7 +139,7 @@ module NativeIOSScreenshots
                 "--store-all", File.join(work, "raw"), rendered)
         validate_output!(rendered)
         zip = File.join(work, "app-store-screenshots.zip")
-        encrypt_zip!(rendered, zip, password)
+        Release.encrypt_zip!(zip, password, rendered)
         File.chmod(0o600, zip)
         File.rename(zip, File.join(destination, File.basename(zip)))
       rescue StandardError => e

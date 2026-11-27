@@ -9,6 +9,30 @@ class NativeIOSReleaseTest < Minitest::Test
   App = Struct.new(:get_beta_groups)
   BetaDetail = Struct.new(:external_build_state, :auto_notify_enabled)
 
+  def test_release_zip_encrypts_both_files_and_keeps_the_originals
+    Dir.mktmpdir do |work|
+      ipa = File.join(work, "source.ipa")
+      symbols = File.join(work, "symbols")
+      published = File.join(work, "published")
+      unpacked = File.join(work, "unpacked")
+      [symbols, published, unpacked].each { |directory| Dir.mkdir(directory) }
+      dsym = File.join(symbols, "source.dSYM.zip")
+      File.binwrite(ipa, "signed IPA fixture")
+      File.binwrite(dsym, "dSYM ZIP fixture")
+      password = Release.archive_password!(env: { "MATCH_PASSWORD" => " fixture-only password " })
+      zip = Release.package_release!({ "ipa" => ipa, "dsym" => dsym }, published, password)
+
+      assert_equal ["release.zip"], Dir.children(published)
+      assert_equal 0o600, File.stat(zip).mode & 0o777
+      assert_equal 2, Release.capture!("/usr/bin/zipinfo", "-v", zip).scan(/file security status:\s+encrypted/).size
+      assert Release.archive_command(password, "-xf", zip, "-C", unpacked)
+      [ipa, dsym].each do |source|
+        assert_equal File.binread(source), File.binread(File.join(unpacked, File.basename(source)))
+      end
+      assert_raises(Release::Error) { Release.package_release!({ "ipa" => ipa }, published, password) }
+    end
+  end
+
   def test_checkout_defaults_are_available_before_reading_host_config
     assert_nil Release.requested_branch(env: { "NATIVE_PROJECT" => "tinglan" })
     assert_nil Release.requested_branch(env: { "NATIVE_PROJECT" => "another_app" })

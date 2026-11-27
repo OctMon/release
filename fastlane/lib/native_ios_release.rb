@@ -254,19 +254,60 @@ module NativeIOSRelease
   end
 
   def save_release_artifacts!
-    build = metadata
-    directory = private_artifact_dir("release")
-    Dir.mktmpdir(".release-", directory) do |staging|
-      %w[ipa dsym].each do |type|
-        source = build.fetch(type)
-        name = File.basename(source)
-        target = File.join(staging, name)
-        FileUtils.cp(source, target)
-        File.chmod(0o600, target)
-        File.rename(target, File.join(directory, name))
-      end
+    password = archive_password!
+    ENV.delete("MATCH_PASSWORD")
+    package_release!(metadata, private_artifact_dir("release"), password)
+    puts "IPA 和 dSYM 已加密保存为 release.zip"
+  end
+
+  def package_release!(build, directory, password)
+    ipa, dsym = build.values_at("ipa", "dsym")
+    unless ipa&.end_with?(".ipa") && dsym&.end_with?(".dSYM.zip") &&
+           File.file?(ipa) && File.file?(dsym)
+      raise Error, "生成 release.zip 需要已构建的 IPA 和 dSYM 压缩包"
     end
-    puts "IPA 和 dSYM 已保存至发布机受限目录"
+
+    output = File.join(directory, "release.zip")
+    Dir.mktmpdir(".release-", directory) do |staging|
+      zip = File.join(staging, "release.zip")
+      encrypt_zip!(zip, password, ipa, dsym)
+      File.chmod(0o600, zip)
+      File.rename(zip, output)
+    end
+    output
+  end
+
+  def archive_password!(env: ENV)
+    password = env["MATCH_PASSWORD"].to_s
+    if password.strip.empty? || password.bytesize > 255 || password.match?(/[\0\r\n]/)
+      raise Error, "加密 ZIP 需要配置非空、单行且不超过 255 字节的 MATCH_PASSWORD"
+    end
+
+    password
+  end
+
+  def archive_command(password, *arguments)
+    # Without a controlling terminal macOS bsdtar reads its prompt from stdin.
+    IO.pipe do |input, writer|
+      writer.write("#{password}\n")
+      writer.close
+      pid = Process.fork do
+        Process.setsid
+        exec({ "MATCH_PASSWORD" => nil }, "/usr/bin/tar", *arguments, in: input, out: File::NULL, err: File::NULL)
+      end
+      Process.wait2(pid).last.success?
+    end
+  end
+
+  def encrypt_zip!(zip, password, *sources)
+    entries = sources.flat_map { |source| ["-C", File.dirname(File.expand_path(source)), "./#{File.basename(source)}"] }
+    unless archive_command(password, "-a", "-cf", zip, "--options", "zip:encryption=aes256",
+                           "--no-mac-metadata", *entries)
+      raise Error, "无法生成 AES-256 ZIP"
+    end
+    unless archive_command(password, "-xOf", zip)
+      raise Error, "无法用 MATCH_PASSWORD 解密 ZIP"
+    end
   end
 
   def capture_store_screenshots!
