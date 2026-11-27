@@ -4,6 +4,8 @@ require_relative "native_ios_release"
 
 module NativeIOSScreenshots
   Release = NativeIOSRelease
+  class SimulatorMigrationError < Release::Error; end
+
   LANGUAGES = %w[zh-Hans zh-Hant en-US].freeze
   PAGES = %w[01-five-tones 02-listening 03-bedtime 04-themes 05-schedule].freeze
   RAW_PAGES = (%w[theme-moonlit theme-bamboo theme-mountain] + (PAGES - ["04-themes"])).freeze
@@ -93,7 +95,7 @@ module NativeIOSScreenshots
       BUILD_PROGRESS.find { |pattern, _| pattern.match?(line) }&.last
   end
 
-  def logged!(log, stage, *command, timeout: 60, heartbeat: 30, chdir: nil, &on_tick)
+  def logged!(log, stage, *command, timeout: 60, heartbeat: 30, chdir: nil, validate_output: nil, &on_tick)
     started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
     progress("开始 #{stage}（上限 #{timeout}s）")
     File.open(log, "a", 0o600) do |stream|
@@ -106,8 +108,10 @@ module NativeIOSScreenshots
         stdin.close
         reader = Thread.new do
           reported = {}
+          captured = +"" if validate_output
           output.each_line do |line|
             stream.puts(line)
+            captured << line if captured
             message = public_progress(line.scrub)
             next unless message
             next if reported[message] && (BUILD_PROGRESS.value?(message) || TEST_PROGRESS.value?(message))
@@ -115,6 +119,7 @@ module NativeIOSScreenshots
             reported[message] = true
             progress("#{stage} · #{message}")
           end
+          captured
         end
         next_heartbeat = heartbeat
         loop do
@@ -135,7 +140,8 @@ module NativeIOSScreenshots
           signal_command("KILL", child.pid)
           raise Release::Error, "#{stage}结束后仍有子进程占用日志管道"
         end
-        reader.value
+        captured = reader.value
+        validate_output&.call(captured)
         unless child.value.success?
           raise Release::Error, "#{stage}失败（#{child.value.exitstatus || "信号 #{child.value.termsig}"}）"
         end
@@ -175,9 +181,26 @@ module NativeIOSScreenshots
 
     id = simulator.fetch("udid")
     results = File.join(work, "#{key}.xcresult")
-    duoctl = [download_duoctl!(work, log), "-d", id]
+    executable = download_duoctl!(work, log)
     booted_here = simulator.fetch("state") == "Shutdown"
-    prepare_duo!(work, log, id, duoctl, device.fetch(:size))
+    progress("Runner 镜像 #{ENV.fetch('ImageOS', '未报告')} / #{ENV.fetch('ImageVersion', '未报告')}")
+    begin
+      begin
+        boot_simulator!(log, "Duo 预检 · 启动并等待系统就绪", id, timeout: 180)
+      rescue SimulatorMigrationError => e
+        progress(e.message)
+        cleanup_simulator(log, "关闭迁移失败的 Duo", "shutdown", id) if booted_here
+        booted_here = false
+        temporary_id = create_temporary_duo!(log)
+        id = temporary_id
+        boot_simulator!(log, "Duo 预检 · 启动新建模拟器", id, timeout: 180)
+      end
+    rescue Release::Error
+      collect_duo_boot_log(log)
+      raise
+    end
+    duoctl = [executable, "-d", id]
+    prepare_duo!(work, log, duoctl, device.fetch(:size))
     xcode = xcode_options(work, project, scheme)
     logged!(log, "构建 Duo 模拟器测试", "xcodebuild", "build-for-testing", *xcode,
             "-destination", "platform=iOS Simulator,id=#{id}", timeout: 600)
@@ -187,7 +210,27 @@ module NativeIOSScreenshots
     capture_duo!(work, log, duoctl, raw, device.fetch(:size), test_command)
     progress("duo 三语素材就绪（#{LANGUAGES.size * RAW_PAGES.size} 张）")
   ensure
-    cleanup_simulator(log, "关闭 #{key}", "shutdown", id) if booted_here
+    cleanup_simulator(log, "关闭 #{key}", "shutdown", id) if booted_here || temporary_id
+    cleanup_simulator(log, "删除临时 Duo", "delete", temporary_id) if temporary_id
+  end
+
+  def create_temporary_duo!(log)
+    id = nil
+    read_id = lambda do |output|
+      id = output.lines.map(&:strip).find { |line| line.match?(/\A[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}\z/i) }
+    end
+    logged!(log, "创建临时 Duo 模拟器", "xcrun", "simctl", "create", "Tinglan Store Duo Retry",
+            "#{DEVICE_PREFIX}iPhone-Duo", DUO_RUNTIME, validate_output: read_id)
+    id || raise(Release::Error, "创建临时 Duo 模拟器未返回 UDID")
+  end
+
+  def boot_simulator!(log, stage, id, timeout:)
+    validate = lambda do |output|
+      if output.match?(/^\s*Data Migration Failed\s*$/)
+        raise SimulatorMigrationError, "#{stage}失败（模拟器数据迁移失败）"
+      end
+    end
+    logged!(log, stage, "xcrun", "simctl", "bootstatus", id, "-b", timeout: timeout, validate_output: validate)
   end
 
   def capture_snapshot!(work, log, project, scheme, device, simulator, raw, probe: false)
@@ -243,9 +286,7 @@ module NativeIOSScreenshots
     File.join(work, source, "duoctl")
   end
 
-  def prepare_duo!(work, log, id, duoctl, size)
-    progress("Runner 镜像 #{ENV.fetch('ImageOS', '未报告')} / #{ENV.fetch('ImageVersion', '未报告')}")
-    logged!(log, "Duo 预检 · 启动并等待系统就绪", "xcrun", "simctl", "bootstatus", id, "-b", timeout: 180)
+  def prepare_duo!(work, log, duoctl, size)
     logged!(log, "展开 Duo 内屏", *duoctl, "open")
     logged!(log, "旋转 Duo 内屏至竖屏", *duoctl, "rotate", "portrait")
     probe = File.join(work, "duo-display-probe.png")
@@ -385,7 +426,7 @@ module NativeIOSScreenshots
     id = simulator.fetch("udid")
     progress("Runner 镜像 #{ENV.fetch('ImageOS', '未报告')} / #{ENV.fetch('ImageVersion', '未报告')}")
     logged!(log, "读取模拟器运行时", "xcrun", "simctl", "list", "runtimes")
-    logged!(log, "单图验证 1/2 · 启动 iPhone 模拟器", "xcrun", "simctl", "bootstatus", id, "-b", timeout: 240)
+    boot_simulator!(log, "单图验证 1/2 · 启动 iPhone 模拟器", id, timeout: 240)
     system_png = File.join(work, "simulator-home.png")
     system_error = nil
     begin
