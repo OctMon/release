@@ -73,10 +73,7 @@ module NativeIOSScreenshots
     shot = line.match(/snapshot: (#{LANGUAGES.join('|')})_(#{RAW_PAGES.join('|')})\s*\z/)
     return "开始拍摄 #{shot[1]} / #{shot[2]}" if shot
 
-    return "启动模拟器" if line.include?("Launch Simulator ")
-    return "等待模拟器主屏幕就绪" if line.include?("seconds for device to fully boot before overriding status bar")
-    return "覆盖状态栏" if line.include?("Overriding Status Bar")
-    return "清除状态栏覆盖" if line.include?("Clearing Status Bar Override")
+    return "启动截图 UI 测试" if line.include?("Running snapshot on:")
 
     BUILD_PROGRESS.find { |pattern, _| pattern.match?(line) }&.last
   end
@@ -186,7 +183,6 @@ module NativeIOSScreenshots
       "FASTLANE_SKIP_UPDATE_CHECK" => "true",
       "FASTLANE_DISABLE_COLORS" => "true",
       "SNAPSHOT_EXECUTE_CONCURRENT_SIMULATORS" => "false",
-      "SNAPSHOT_SIMULATOR_WAIT_FOR_BOOT_TIMEOUT" => "10",
       "TEST_RUNNER_TINGLAN_FASTLANE_SNAPSHOT" => "1"
     }
     logged!(log, "snapshot 采集 #{key}", env, "bundle", "exec", "fastlane", "snapshot",
@@ -196,8 +192,7 @@ module NativeIOSScreenshots
             "--xcargs=-parallel-testing-enabled NO -skipMacroValidation CODE_SIGNING_ALLOWED=NO",
             "--output_directory", output, "--buildlog_path", File.join(output, "logs"),
             "--test_without_building", "--headless", "--skip_open_summary", "--result_bundle",
-            "--override_status_bar",
-            "--override_status_bar_arguments=--time 14:09 --dataNetwork wifi --wifiMode active --wifiBars 3 --cellularMode active --operatorName '' --cellularBars 4 --batteryState charged --batteryLevel 100",
+            "--override_status_bar", "false",
             "--number_of_retries", "0", "--stop_after_first_error", "--disable_xcpretty",
             chdir: Release.source_dir, timeout: 900)
     import_snapshot!(output, raw, name, device.fetch(:size))
