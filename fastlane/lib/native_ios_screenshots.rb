@@ -22,8 +22,12 @@ module NativeIOSScreenshots
     /Unable to boot|Failed to boot|failed to start the simulator/i => "模拟器启动失败",
     /Failed to (?:install|launch) (?:the )?(?:app|application|test runner)|Early unexpected exit/i => "应用或测试运行器启动失败",
     /Failed to establish communication|Failed to connect to the test|Lost connection to the test|test runner.*timed out/i => "与 XCTest 运行器的连接失败",
+    /exceeded (?:its |the )?(?:test )?execution time allowance|test execution time allowance.*exceeded/i => "XCTest 用例超过执行时限",
     /Test Case .* failed|error: .*XCTAssert|error: .*XCTUnwrap/i => "XCTest 用例失败",
     /\*\* TEST FAILED \*\*/ => "xcodebuild 报告测试失败",
+    /\bt =\s*[\d.]+s\s+Set device orientation/ => "XCTest 正在设置设备方向",
+    /\bt =\s*[\d.]+s\s+Launch / => "XCTest 正在启动 App",
+    /\bt =\s*[\d.]+s\s+Wait for .* to idle/ => "XCTest 正在等待 App 就绪",
     /Test Case .* started/ => "XCTest 已进入截图用例"
   }.freeze
   DEVICES = [
@@ -97,7 +101,8 @@ module NativeIOSScreenshots
       stream.flush
       options = { pgroup: true }
       options[:chdir] = chdir if chdir
-      Open3.popen2e(*command, **options) do |stdin, output, child|
+      stdin, output, child = Open3.popen2e(*command, **options)
+      begin
         stdin.close
         reader = Thread.new do
           reported = {}
@@ -139,13 +144,14 @@ module NativeIOSScreenshots
           signal_command("TERM", child.pid)
           unless child.join(3)
             signal_command("KILL", child.pid)
-            child.join
+            child.join(1)
           end
         end
         if reader&.alive?
           reader.kill
-          reader.join
+          reader.join(1)
         end
+        output.close
       end
     end
     elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
@@ -170,12 +176,15 @@ module NativeIOSScreenshots
     id = simulator.fetch("udid")
     results = File.join(work, "#{key}.xcresult")
     booted_here = false
+    xcode = xcode_options(work, project, scheme)
+    logged!(log, "构建 Duo 模拟器测试", "xcodebuild", "build-for-testing", *xcode,
+            "-destination", "platform=iOS Simulator,id=#{id}", timeout: 600)
     if simulator.fetch("state") == "Shutdown"
       logged!(log, "启动 #{key}", "xcrun", "simctl", "boot", id)
       booted_here = true
     end
     logged!(log, "等待 #{key} 启动", "xcrun", "simctl", "bootstatus", id, timeout: 180)
-    test_command = ["xcodebuild", "test-without-building", *xcode_options(work, project, scheme),
+    test_command = ["xcodebuild", "test-without-building", *xcode,
                     "-destination", "platform=iOS Simulator,id=#{id}", "-parallel-testing-enabled", "NO",
                     "-only-testing:TinglanUITests/PadUITests/#{device.fetch(:test)}", "-resultBundlePath", results]
     capture_duo!(work, log, id, raw, device.fetch(:size), test_command)
@@ -200,9 +209,9 @@ module NativeIOSScreenshots
             "--project", project, "--scheme", scheme, "--derived_data_path", File.join(work, "derived-data"),
             "--configuration", "Debug", "--devices", name, "--ios_version", "27.2",
             "--languages", LANGUAGES.join(","), "--only_testing", "TinglanUITests/PadUITests/#{device.fetch(:test)}",
-            "--xcargs=-parallel-testing-enabled NO -skipMacroValidation CODE_SIGNING_ALLOWED=NO",
+            "--xcargs=-parallel-testing-enabled NO -test-timeouts-enabled YES -maximum-test-execution-time-allowance 180 -skipMacroValidation CODE_SIGNING_ALLOWED=NO",
             "--output_directory", output, "--buildlog_path", File.join(output, "logs"),
-            "--test_without_building", "--headless", "--skip_open_summary", "--result_bundle",
+            "--headless", "--skip_open_summary", "--result_bundle",
             "--override_status_bar", "false",
             "--number_of_retries", "0", "--stop_after_first_error", "--disable_xcpretty",
             chdir: Release.source_dir, timeout: 900)
@@ -347,16 +356,12 @@ module NativeIOSScreenshots
         scheme = config.fetch("scheme")
         progress("读取 iOS 27.2 模拟器清单")
         devices = JSON.parse(Release.capture!("xcrun", "simctl", "list", "devices", "available", "-j")).fetch("devices")
-        iphone = simulator_for!(DEVICES.first, devices)
-        id = iphone.fetch("udid")
-        logged!(log, "构建模拟器测试", "xcodebuild", "build-for-testing", *xcode_options(work, project, scheme),
-                "-destination", "platform=iOS Simulator,id=#{id}", timeout: 600)
         captured = []
         duo_error = nil
         DEVICES.each do |device|
           begin
             progress("准备 #{device.fetch(:key)} 模拟器")
-            simulator = device.equal?(DEVICES.first) ? iphone : simulator_for!(device, devices)
+            simulator = simulator_for!(device, devices)
             capture_device!(work, log, project, scheme, device, simulator)
             captured << device
           rescue Release::Error => e
