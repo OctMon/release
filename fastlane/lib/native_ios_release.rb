@@ -296,16 +296,29 @@ module NativeIOSRelease
         Process.setsid
         exec({ "MATCH_PASSWORD" => nil }, "/usr/bin/tar", *arguments, in: input, out: File::NULL, err: File::NULL)
       end
-      Process.wait2(pid).last.success?
+      child = Process.detach(pid)
+      unless child.join(120)
+        # The archiver starts a new session to read the passphrase from stdin.
+        begin
+          Process.kill("KILL", -pid)
+        rescue Errno::ESRCH
+          nil
+        end
+        child.join
+        raise Error, "AES-256 ZIP 工具超时（120s）"
+      end
+      child.value.success?
     end
   end
 
   def encrypt_zip!(zip, password, *sources)
     entries = sources.flat_map { |source| ["-C", File.dirname(File.expand_path(source)), "./#{File.basename(source)}"] }
+    yield "开始 AES-256 加密" if block_given?
     unless archive_command(password, "-a", "-cf", zip, "--options", "zip:encryption=aes256",
                            "--no-mac-metadata", *entries)
       raise Error, "无法生成 AES-256 ZIP"
     end
+    yield "开始验证加密 ZIP 能否解包" if block_given?
     unless archive_command(password, "-xOf", zip)
       raise Error, "无法用 MATCH_PASSWORD 解密 ZIP"
     end

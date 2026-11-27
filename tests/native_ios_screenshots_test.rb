@@ -6,6 +6,34 @@ require_relative "../fastlane/lib/native_ios_screenshots"
 class NativeIOSScreenshotsTest < Minitest::Test
   Screenshots = NativeIOSScreenshots
 
+  def test_capture_reports_safe_progress_and_keeps_raw_output_off_console
+    Dir.mktmpdir do |directory|
+      log = File.join(directory, "capture.log")
+      stdout, = capture_io do
+        Screenshots.logged!(log, "测试阶段", RbConfig.ruby, "-e",
+                            %q(puts "private fixture"; puts "    t = 9.09s Added attachment named 'en-US_02-listening'"))
+      end
+      assert_includes stdout, "开始 测试阶段"
+      assert_includes stdout, "已拍摄 en-US / 02-listening"
+      assert_includes stdout, "完成 测试阶段"
+      refute_includes stdout, "private fixture"
+      assert_includes File.read(log), "private fixture"
+    end
+  end
+
+  def test_timeout_reports_the_stage_after_printing_a_heartbeat
+    Dir.mktmpdir do |directory|
+      log = File.join(directory, "capture.log")
+      stdout, = capture_io do
+        error = assert_raises(NativeIOSRelease::Error) do
+          Screenshots.logged!(log, "Duo 采集", RbConfig.ruby, "-e", "sleep 10", timeout: 0.3, heartbeat: 0.1)
+        end
+        assert_includes error.message, "Duo 采集超时"
+      end
+      assert_includes stdout, "Duo 采集仍在运行"
+    end
+  end
+
   def test_hosted_simulator_selection_uses_only_the_requested_runtime_and_device
     iphone, ipad, duo = Screenshots::DEVICES
     phone_17 = simulator("iPhone-17-Pro-Max")

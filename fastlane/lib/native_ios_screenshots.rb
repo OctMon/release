@@ -9,6 +9,13 @@ module NativeIOSScreenshots
   RAW_PAGES = (%w[theme-moonlit theme-bamboo theme-mountain] + (PAGES - ["04-themes"])).freeze
   RUNTIME = "com.apple.CoreSimulator.SimRuntime.iOS-27-2"
   DEVICE_PREFIX = "com.apple.CoreSimulator.SimDeviceType."
+  BUILD_PROGRESS = {
+    /Resolving Package Graph|Resolve Package Graph/ => "解析 Swift Package 依赖",
+    /Fetch(?:ing|ed) |Updating from / => "获取 Swift Package 依赖",
+    /CreateBuildDescription|ComputeTargetDependencyGraph/ => "准备编译目标",
+    /SwiftCompile |SwiftDriver |CompileSwift/ => "正在编译 Swift",
+    /LinkStoryboards |CopySwiftLibs |WriteAuxiliaryFile / => "正在处理构建产物"
+  }.freeze
   DEVICES = [
     { key: "iphone", types: [/\AiPhone-17-Pro-Max\z/, /\AiPhone-18-Pro-Max\z/],
       test: "testCaptureLocalizedStoreScreenshots", size: [1320, 2868], output: "screenshots" },
@@ -49,13 +56,76 @@ module NativeIOSScreenshots
     raise Release::Error, "未找到可用的 iOS 27.2 #{device.fetch(:key)} 模拟器"
   end
 
-  def logged!(log, stage, *command)
+  def progress(message)
+    $stdout.puts("[截图] #{message}")
+    $stdout.flush
+  end
+
+  def public_progress(line)
+    attachment = line.match(/Added attachment named '(#{LANGUAGES.join('|')})_(#{RAW_PAGES.join('|')})'\s*\z/)
+    return "已拍摄 #{attachment[1]} / #{attachment[2]}" if attachment
+
+    BUILD_PROGRESS.find { |pattern, _| pattern.match?(line) }&.last
+  end
+
+  def logged!(log, stage, *command, timeout: 60, heartbeat: 30)
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    progress("开始 #{stage}（上限 #{timeout}s）")
     File.open(log, "a", 0o600) do |stream|
       stream.puts("\n--- #{stage} ---")
       stream.flush
-      return if system(*command, out: stream, err: [:child, :out])
+      Open3.popen2e(*command, pgroup: true) do |stdin, output, child|
+        stdin.close
+        reader = Thread.new do
+          reported = {}
+          output.each_line do |line|
+            stream.puts(line)
+            message = public_progress(line.scrub)
+            next unless message && !reported[message]
+
+            reported[message] = true
+            progress("#{stage} · #{message}")
+          end
+        end
+        loop do
+          remaining = timeout - (Process.clock_gettime(Process::CLOCK_MONOTONIC) - started)
+          break if remaining.positive? && child.join([heartbeat, remaining].min)
+
+          elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+          raise Release::Error, "#{stage}超时（#{timeout}s）" if elapsed >= timeout
+
+          progress("#{stage}仍在运行（#{elapsed.round}s）")
+        end
+        unless reader.join(5)
+          signal_command("KILL", child.pid)
+          raise Release::Error, "#{stage}结束后仍有子进程占用日志管道"
+        end
+        reader.value
+        unless child.value.success?
+          raise Release::Error, "#{stage}失败（#{child.value.exitstatus || "信号 #{child.value.termsig}"}）"
+        end
+      ensure
+        if child&.alive?
+          signal_command("TERM", child.pid)
+          unless child.join(3)
+            signal_command("KILL", child.pid)
+            child.join
+          end
+        end
+        if reader&.alive?
+          reader.kill
+          reader.join
+        end
+      end
     end
-    raise Release::Error, "#{stage}失败"
+    elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+    progress("完成 #{stage}（#{elapsed.round}s）")
+  end
+
+  def signal_command(signal, pid)
+    Process.kill(signal, -pid)
+  rescue Errno::ESRCH
+    nil
   end
 
   def capture_device!(work, log, xcode, device, simulator)
@@ -68,7 +138,7 @@ module NativeIOSScreenshots
       logged!(log, "启动 #{key}", "xcrun", "simctl", "boot", id)
       booted_here = true
     end
-    logged!(log, "等待 #{key} 启动", "xcrun", "simctl", "bootstatus", id)
+    logged!(log, "等待 #{key} 启动", "xcrun", "simctl", "bootstatus", id, timeout: 180)
     logged!(log, "固定 #{key} 状态栏", "xcrun", "simctl", "status_bar", id, "override",
             "--time", "14:09", "--dataNetwork", "wifi", "--wifiMode", "active", "--wifiBars", "3",
             "--cellularMode", "active", "--cellularBars", "4", "--batteryState", "discharging", "--batteryLevel", "100")
@@ -76,10 +146,11 @@ module NativeIOSScreenshots
     begin
       logged!(log, "采集 #{key}", "xcodebuild", "test-without-building", *xcode,
               "-destination", "platform=iOS Simulator,id=#{id}", "-parallel-testing-enabled", "NO",
-              "-only-testing:TinglanUITests/PadUITests/#{device.fetch(:test)}", "-resultBundlePath", results)
+              "-only-testing:TinglanUITests/PadUITests/#{device.fetch(:test)}", "-resultBundlePath", results,
+              timeout: key == "duo" ? 240 : 360)
     rescue Release::Error => e
       if key == "duo"
-        raise Release::Error, "Duo 内屏采集失败，请核对模拟器展开状态及 2007 × 2853 竖屏尺寸"
+        raise Release::Error, "#{e.message}。Duo 需要展开内屏和 2007 × 2853 竖屏尺寸"
       end
       raise e
     end
@@ -87,13 +158,16 @@ module NativeIOSScreenshots
     logged!(log, "导出 #{key} 截图", "xcrun", "xcresulttool", "export", "attachments",
             "--path", results, "--output-path", exported)
     import_attachments!(exported, File.join(work, "raw", key))
+    progress("#{key} 三语素材就绪（#{LANGUAGES.size * RAW_PAGES.size} 张）")
   ensure
-    if time_overridden || booted_here
-      File.open(log, "a", 0o600) do |stream|
-        system("xcrun", "simctl", "status_bar", id, "clear", out: stream, err: [:child, :out]) if time_overridden
-        system("xcrun", "simctl", "shutdown", id, out: stream, err: [:child, :out]) if booted_here
-      end
-    end
+    cleanup_simulator(log, "清除 #{key} 状态栏覆盖", "status_bar", id, "clear") if time_overridden
+    cleanup_simulator(log, "关闭 #{key}", "shutdown", id) if booted_here
+  end
+
+  def cleanup_simulator(log, stage, *arguments)
+    logged!(log, stage, "xcrun", "simctl", *arguments, timeout: 15)
+  rescue Release::Error => e
+    progress(e.message)
   end
 
   def import_attachments!(exported, raw)
@@ -147,18 +221,20 @@ module NativeIOSScreenshots
       log = File.join(work, "capture.log")
       begin
         config = Release.screenshot_project
+        progress("读取 iOS 27.2 模拟器清单")
         devices = JSON.parse(Release.capture!("xcrun", "simctl", "list", "devices", "available", "-j")).fetch("devices")
         iphone = simulator_for!(DEVICES.first, devices)
         xcode = ["-project", File.join(Release.source_dir, config.fetch("project")), "-scheme", config.fetch("scheme"),
                  "-configuration", "Debug", "-derivedDataPath", File.join(work, "derived-data"),
-                 "-skipMacroValidation", "-quiet", "CODE_SIGNING_ALLOWED=NO"]
+                 "-skipMacroValidation", "CODE_SIGNING_ALLOWED=NO"]
         id = iphone.fetch("udid")
         logged!(log, "构建模拟器测试", "xcodebuild", "build-for-testing", *xcode,
-                "-destination", "platform=iOS Simulator,id=#{id}")
+                "-destination", "platform=iOS Simulator,id=#{id}", timeout: 600)
         captured = []
         duo_error = nil
         DEVICES.each do |device|
           begin
+            progress("准备 #{device.fetch(:key)} 模拟器")
             simulator = device.equal?(DEVICES.first) ? iphone : simulator_for!(device, devices)
             capture_device!(work, log, xcode, device, simulator)
             captured << device
@@ -166,18 +242,21 @@ module NativeIOSScreenshots
             raise unless device.fetch(:key) == "duo"
 
             duo_error = e
+            progress("#{e.message}，继续打包已完成的 iPhone 和 iPad")
           end
         end
         rendered = File.join(work, "app-store-screenshots")
         logged!(log, "渲染商店截图", "swift", File.join(Release.source_dir, "Scripts", "RenderStorePreview.swift"),
-                duo_error ? "--store" : "--store-all", File.join(work, "raw"), rendered)
+                duo_error ? "--store" : "--store-all", File.join(work, "raw"), rendered, timeout: 120)
+        progress("校验成品尺寸、张数和 PNG 格式")
         validate_output!(rendered, devices: captured)
         zip = File.join(work, "app-store-screenshots.zip")
-        Release.encrypt_zip!(zip, password, rendered)
+        Release.encrypt_zip!(zip, password, rendered) { |message| progress(message) }
         File.chmod(0o600, zip)
         output = File.join(destination, File.basename(zip))
         File.rename(zip, output)
         Release.outputs(zip_path: output, artifact_name: duo_error ? "app-store-screenshots-iphone-ipad" : "app-store-screenshots")
+        progress("加密 ZIP 校验完成，交给 Actions 上传")
         raise Release::Error, "#{duo_error.message}。已生成加密的 iPhone/iPad 截图 ZIP" if duo_error
       rescue StandardError => e
         diagnostic = Dir.mktmpdir("diagnostics-", destination)
