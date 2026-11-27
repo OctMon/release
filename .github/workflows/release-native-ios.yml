@@ -178,7 +178,7 @@ jobs:
     needs: prepare
     if: ${{ inputs.generate_screenshots }}
     runs-on: xcode-27
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
       NATIVE_PROJECT: ${{ inputs.project }}
@@ -200,6 +200,7 @@ jobs:
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.4'
+          bundler-cache: true
 
       - name: Checkout pinned app source for screenshots
         run: |
