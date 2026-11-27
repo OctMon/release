@@ -256,7 +256,8 @@ module NativeIOSRelease
   def save_release_artifacts!
     password = archive_password!
     ENV.delete("MATCH_PASSWORD")
-    package_release!(metadata, private_artifact_dir("release"), password)
+    zip = package_release!(metadata, private_artifact_dir("release"), password)
+    outputs(zip_path: zip)
     puts "IPA 和 dSYM 已加密保存为 release.zip"
   end
 

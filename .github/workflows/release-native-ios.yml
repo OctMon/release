@@ -119,11 +119,21 @@ jobs:
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Save encrypted release ZIP on the runner
-        id: artifact
+      - name: Create encrypted release ZIP
+        id: package
         run: bundle exec ruby -r ./fastlane/lib/native_ios_release -e 'NativeIOSRelease.save_release_artifacts!'
         env:
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+
+      - name: Upload encrypted release ZIP
+        id: artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-zip-${{ github.run_attempt }}
+          path: ${{ steps.package.outputs.zip_path }}
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Write build number back to the source branch
         id: writeback
@@ -167,7 +177,7 @@ jobs:
     name: Generate App Store screenshots
     needs: prepare
     if: ${{ inputs.generate_screenshots }}
-    runs-on: [xcode-27, native-ios-screenshots]
+    runs-on: xcode-27
     timeout-minutes: 45
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
@@ -198,13 +208,21 @@ jobs:
           TARGET_REPO: ${{ secrets[format('{0}_IOS_REPO', inputs.project)] }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Capture and save the private screenshot ZIP
+      - name: Capture and encrypt App Store screenshots
+        id: capture
         run: ruby -r ./fastlane/lib/native_ios_release -e 'NativeIOSRelease.capture_store_screenshots!'
         env:
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
-          NATIVE_SCREENSHOT_IPHONE_UDID: ${{ vars.NATIVE_SCREENSHOT_IPHONE_UDID }}
-          NATIVE_SCREENSHOT_IPAD_UDID: ${{ vars.NATIVE_SCREENSHOT_IPAD_UDID }}
-          NATIVE_SCREENSHOT_DUO_UDID: ${{ vars.NATIVE_SCREENSHOT_DUO_UDID }}
+
+      - name: Upload encrypted screenshot ZIP
+        if: ${{ !cancelled() && steps.capture.outputs.zip_path != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.capture.outputs.artifact_name }}-${{ github.run_attempt }}
+          path: ${{ steps.capture.outputs.zip_path }}
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
 
   summary:
     name: Summarize selected actions

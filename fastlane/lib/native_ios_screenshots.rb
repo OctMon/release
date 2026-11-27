@@ -7,29 +7,46 @@ module NativeIOSScreenshots
   LANGUAGES = %w[zh-Hans zh-Hant en-US].freeze
   PAGES = %w[01-five-tones 02-listening 03-bedtime 04-themes 05-schedule].freeze
   RAW_PAGES = (%w[theme-moonlit theme-bamboo theme-mountain] + (PAGES - ["04-themes"])).freeze
+  RUNTIME = "com.apple.CoreSimulator.SimRuntime.iOS-27-2"
+  DEVICE_PREFIX = "com.apple.CoreSimulator.SimDeviceType."
   DEVICES = [
-    { key: "iphone", variable: "NATIVE_SCREENSHOT_IPHONE_UDID", type: /\AiPhone-17-Pro-Max\z/,
+    { key: "iphone", types: [/\AiPhone-17-Pro-Max\z/, /\AiPhone-18-Pro-Max\z/],
       test: "testCaptureLocalizedStoreScreenshots", size: [1320, 2868], output: "screenshots" },
-    { key: "ipad", variable: "NATIVE_SCREENSHOT_IPAD_UDID", type: /\AiPad-Pro-13-inch-M5(?:-\d+GB)?\z/,
+    { key: "ipad", types: [/\AiPad-Pro-13-inch-M5(?:-\d+GB)?\z/],
       test: "testCaptureLocalizedStoreScreenshots", size: [2064, 2752], output: "screenshots-ipad" },
-    { key: "duo", variable: "NATIVE_SCREENSHOT_DUO_UDID", type: /\AiPhone-Duo\z/,
+    { key: "duo", types: [/\AiPhone-Duo\z/],
       test: "testCaptureDuoStoreScreenshots", size: [2007, 2853], output: "screenshots-duo" }
   ].freeze
 
   module_function
 
-  def simulator_ids(devices, env: ENV)
-    available = devices.fetch("com.apple.CoreSimulator.SimRuntime.iOS-27-2", [])
-    DEVICES.to_h do |device|
-      udid = Release.required(device.fetch(:variable), env: env)
-      simulator = available.find { |item| item["udid"] == udid && item["isAvailable"] }
-      type = simulator&.fetch("deviceTypeIdentifier", "")&.delete_prefix("com.apple.CoreSimulator.SimDeviceType.")
-      unless type&.match?(device.fetch(:type)) && %w[Shutdown Booted].include?(simulator["state"])
-        raise Release::Error, "#{device.fetch(:variable)} 须指向对应的 iOS 27.2 专用截图模拟器"
+  def select_simulator(device, devices)
+    available = devices.fetch(RUNTIME, [])
+    device.fetch(:types).each do |pattern|
+      match = available.find do |item|
+        item["isAvailable"] && %w[Shutdown Booted].include?(item["state"]) &&
+          pattern.match?(item.fetch("deviceTypeIdentifier", "").delete_prefix(DEVICE_PREFIX))
       end
-
-      [device.fetch(:key), simulator]
+      return match if match
     end
+    nil
+  end
+
+  def simulator_for!(device, devices)
+    simulator = select_simulator(device, devices)
+    return simulator if simulator
+
+    types = JSON.parse(Release.capture!("xcrun", "simctl", "list", "devicetypes", "-j")).fetch("devicetypes")
+    device.fetch(:types).each do |pattern|
+      types.each do |type|
+        identifier = type.fetch("identifier")
+        next unless pattern.match?(identifier.delete_prefix(DEVICE_PREFIX))
+
+        udid, _, status = Open3.capture3("xcrun", "simctl", "create", "Tinglan Store #{device.fetch(:key)}", identifier, RUNTIME)
+        return { "udid" => udid.strip, "state" => "Shutdown" } if status.success?
+      end
+    end
+    raise Release::Error, "未找到可用的 iOS 27.2 #{device.fetch(:key)} 模拟器"
   end
 
   def logged!(log, stage, *command)
@@ -38,7 +55,7 @@ module NativeIOSScreenshots
       stream.flush
       return if system(*command, out: stream, err: [:child, :out])
     end
-    raise Release::Error, "#{stage}失败，请查看发布机上的诊断文件"
+    raise Release::Error, "#{stage}失败"
   end
 
   def capture_device!(work, log, xcode, device, simulator)
@@ -56,9 +73,16 @@ module NativeIOSScreenshots
             "--time", "14:09", "--dataNetwork", "wifi", "--wifiMode", "active", "--wifiBars", "3",
             "--cellularMode", "active", "--cellularBars", "4", "--batteryState", "discharging", "--batteryLevel", "100")
     time_overridden = true
-    logged!(log, "采集 #{key}", "xcodebuild", "test-without-building", *xcode,
-            "-destination", "platform=iOS Simulator,id=#{id}", "-parallel-testing-enabled", "NO",
-            "-only-testing:TinglanUITests/PadUITests/#{device.fetch(:test)}", "-resultBundlePath", results)
+    begin
+      logged!(log, "采集 #{key}", "xcodebuild", "test-without-building", *xcode,
+              "-destination", "platform=iOS Simulator,id=#{id}", "-parallel-testing-enabled", "NO",
+              "-only-testing:TinglanUITests/PadUITests/#{device.fetch(:test)}", "-resultBundlePath", results)
+    rescue Release::Error => e
+      if key == "duo"
+        raise Release::Error, "Duo 内屏采集失败，请核对模拟器展开状态及 2007 × 2853 竖屏尺寸"
+      end
+      raise e
+    end
     exported = File.join(work, "#{key}-attachments")
     logged!(log, "导出 #{key} 截图", "xcrun", "xcresulttool", "export", "attachments",
             "--path", results, "--output-path", exported)
@@ -98,8 +122,8 @@ module NativeIOSScreenshots
     end
   end
 
-  def validate_output!(rendered)
-    DEVICES.each do |device|
+  def validate_output!(rendered, devices: DEVICES)
+    devices.each do |device|
       LANGUAGES.each do |language|
         folder = File.join(rendered, device.fetch(:output), language)
         unless Dir.children(folder).sort == PAGES.map { |page| "#{page}.png" }.sort
@@ -108,7 +132,7 @@ module NativeIOSScreenshots
         PAGES.each { |page| validate_png!(File.join(folder, "#{page}.png"), device.fetch(:size)) }
       end
     end
-    expected_overviews = DEVICES.flat_map { |device| LANGUAGES.map { |language| "#{device.fetch(:key)}-#{language}.png" } }
+    expected_overviews = devices.flat_map { |device| LANGUAGES.map { |language| "#{device.fetch(:key)}-#{language}.png" } }
     unless Dir.children(File.join(rendered, "overviews")).sort == expected_overviews.sort
       raise Release::Error, "商店图总览缺少设备或语言"
     end
@@ -124,35 +148,48 @@ module NativeIOSScreenshots
       begin
         config = Release.screenshot_project
         devices = JSON.parse(Release.capture!("xcrun", "simctl", "list", "devices", "available", "-j")).fetch("devices")
-        simulators = simulator_ids(devices)
+        iphone = simulator_for!(DEVICES.first, devices)
         xcode = ["-project", File.join(Release.source_dir, config.fetch("project")), "-scheme", config.fetch("scheme"),
                  "-configuration", "Debug", "-derivedDataPath", File.join(work, "derived-data"),
                  "-skipMacroValidation", "-quiet", "CODE_SIGNING_ALLOWED=NO"]
-        id = simulators.fetch("iphone").fetch("udid")
+        id = iphone.fetch("udid")
         logged!(log, "构建模拟器测试", "xcodebuild", "build-for-testing", *xcode,
                 "-destination", "platform=iOS Simulator,id=#{id}")
+        captured = []
+        duo_error = nil
         DEVICES.each do |device|
-          capture_device!(work, log, xcode, device, simulators.fetch(device.fetch(:key)))
+          begin
+            simulator = device.equal?(DEVICES.first) ? iphone : simulator_for!(device, devices)
+            capture_device!(work, log, xcode, device, simulator)
+            captured << device
+          rescue Release::Error => e
+            raise unless device.fetch(:key) == "duo"
+
+            duo_error = e
+          end
         end
         rendered = File.join(work, "app-store-screenshots")
         logged!(log, "渲染商店截图", "swift", File.join(Release.source_dir, "Scripts", "RenderStorePreview.swift"),
-                "--store-all", File.join(work, "raw"), rendered)
-        validate_output!(rendered)
+                duo_error ? "--store" : "--store-all", File.join(work, "raw"), rendered)
+        validate_output!(rendered, devices: captured)
         zip = File.join(work, "app-store-screenshots.zip")
         Release.encrypt_zip!(zip, password, rendered)
         File.chmod(0o600, zip)
-        File.rename(zip, File.join(destination, File.basename(zip)))
+        output = File.join(destination, File.basename(zip))
+        File.rename(zip, output)
+        Release.outputs(zip_path: output, artifact_name: duo_error ? "app-store-screenshots-iphone-ipad" : "app-store-screenshots")
+        raise Release::Error, "#{duo_error.message}。已生成加密的 iPhone/iPad 截图 ZIP" if duo_error
       rescue StandardError => e
         diagnostic = Dir.mktmpdir("diagnostics-", destination)
         File.open(log, "a", 0o600) { |stream| stream.puts("#{e.class}: #{e.message}") }
         [log, *Dir.glob(File.join(work, "*.xcresult"))].each do |file|
           File.rename(file, File.join(diagnostic, File.basename(file)))
         end
-        reason = e.is_a?(Release::Error) ? e.message : "商店截图失败，请查看发布机上的诊断文件"
+        reason = e.is_a?(Release::Error) ? e.message : "商店截图处理失败"
         raise Release::Error, reason, cause: nil
       end
     end
-    puts "45 张商店截图已打包至发布机受限目录"
+    puts "45 张商店截图已打包为加密 ZIP"
   ensure
     File.umask(previous_umask) if previous_umask
   end
