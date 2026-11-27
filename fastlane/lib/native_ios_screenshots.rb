@@ -85,7 +85,7 @@ module NativeIOSScreenshots
     shot = line.match(/snapshot: (#{LANGUAGES.join('|')})_(#{RAW_PAGES.join('|')})\s*\z/)
     return "开始拍摄 #{shot[1]} / #{shot[2]}" if shot
 
-    return "启动截图 UI 测试" if line.include?("Running snapshot on:")
+    return "Fastlane 已选定截图设备" if line.include?("Running snapshot on:")
     exit_code = line[/Caught error\.\.\. (\d{1,3})\b/i, 1]
     return "xcodebuild 返回退出码 #{exit_code}" if exit_code
 
@@ -175,8 +175,9 @@ module NativeIOSScreenshots
 
     id = simulator.fetch("udid")
     results = File.join(work, "#{key}.xcresult")
+    duoctl = [download_duoctl!(work, log), "-d", id]
     booted_here = simulator.fetch("state") == "Shutdown"
-    duoctl = prepare_duo!(work, log, id, device.fetch(:size))
+    prepare_duo!(work, log, id, duoctl, device.fetch(:size))
     xcode = xcode_options(work, project, scheme)
     logged!(log, "构建 Duo 模拟器测试", "xcodebuild", "build-for-testing", *xcode,
             "-destination", "platform=iOS Simulator,id=#{id}", timeout: 600)
@@ -196,6 +197,19 @@ module NativeIOSScreenshots
     languages = probe ? ["zh-Hans"] : LANGUAGES
     pages = probe ? ["01-five-tones"] : RAW_PAGES
     test = probe ? "testCaptureSnapshotHomeProbe" : device.fetch(:test)
+    snapshot_options = []
+    if probe
+      package_path = File.join(work, "source-packages")
+      xcode = xcode_options(work, project, scheme)
+      destination = "platform=iOS Simulator,id=#{simulator.fetch('udid')}"
+      logged!(log, "单图验证 · 解析 Swift Package 依赖", "xcodebuild", "-resolvePackageDependencies",
+              *xcode, "-destination", destination, "-clonedSourcePackagesDirPath", package_path, timeout: 600)
+      logged!(log, "单图验证 · 构建截图测试", "xcodebuild", "build-for-testing",
+              *xcode, "-destination", destination, "-clonedSourcePackagesDirPath", package_path,
+              "-disableAutomaticPackageResolution", timeout: 600)
+      snapshot_options = ["--test_without_building", "--skip_package_dependencies_resolution",
+                          "--disable_package_automatic_updates", "--cloned_source_packages_path", package_path]
+    end
     env = {
       "BUNDLE_GEMFILE" => File.expand_path("../../Gemfile", __dir__),
       "FASTLANE_OPT_OUT_USAGE" => "true",
@@ -212,27 +226,32 @@ module NativeIOSScreenshots
             "--output_directory", output, "--buildlog_path", File.join(output, "logs"),
             "--headless", "--skip_open_summary", "--result_bundle",
             "--override_status_bar", "false",
-            "--number_of_retries", "0", "--stop_after_first_error", "--disable_xcpretty",
+            "--number_of_retries", "0", "--stop_after_first_error", "--disable_xcpretty", *snapshot_options,
             chdir: Release.source_dir, timeout: probe ? 600 : 900)
     import_snapshot!(output, raw, name, device.fetch(:size), languages: languages, pages: pages)
   end
 
-  def prepare_duo!(work, log, id, size)
+  def download_duoctl!(work, log)
+    archive = File.join(work, "duoctl.tar.gz")
+    url = "https://codeload.github.com/skarol/duoctl/tar.gz/#{DUOCTL_REVISION}"
+    logged!(log, "下载固定版本 duoctl 源码归档", "/usr/bin/curl", "--fail", "--silent", "--show-error",
+            "--connect-timeout", "10", "--max-time", "30", "--retry", "2", "--retry-all-errors",
+            "--output", archive, url, timeout: 105)
+    source = "duoctl-#{DUOCTL_REVISION}/skills/duoctl/scripts"
+    logged!(log, "解包 duoctl 与模拟器助手源码", "/usr/bin/tar", "-xzf", archive, "-C", work,
+            "#{source}/duoctl", "#{source}/duoctl-helper.m", timeout: 30)
+    File.join(work, source, "duoctl")
+  end
+
+  def prepare_duo!(work, log, id, duoctl, size)
     progress("Runner 镜像 #{ENV.fetch('ImageOS', '未报告')} / #{ENV.fetch('ImageVersion', '未报告')}")
     logged!(log, "Duo 预检 · 启动并等待系统就绪", "xcrun", "simctl", "bootstatus", id, "-b", timeout: 180)
-    source = File.join(work, "duoctl")
-    logged!(log, "准备 duoctl 源码目录", "git", "init", "--quiet", source)
-    logged!(log, "下载固定版本 duoctl", "git", "-C", source, "fetch", "--quiet", "--depth", "1",
-            "https://github.com/skarol/duoctl.git", DUOCTL_REVISION)
-    logged!(log, "检出固定版本 duoctl", "git", "-C", source, "checkout", "--quiet", "--detach", DUOCTL_REVISION)
-    duoctl = [File.join(source, "bin", "duoctl"), "-d", id]
     logged!(log, "展开 Duo 内屏", *duoctl, "open")
     logged!(log, "旋转 Duo 内屏至竖屏", *duoctl, "rotate", "portrait")
     probe = File.join(work, "duo-display-probe.png")
     logged!(log, "Duo 预检 · 截取活动内屏", *duoctl, "screenshot", probe, timeout: 30)
     validate_raw_png!(probe, size, "Duo 内屏预检")
     progress("Duo 内屏预检通过（#{size.join(' × ')}）")
-    duoctl
   rescue Release::Error
     collect_duo_boot_log(log)
     raise
@@ -379,7 +398,7 @@ module NativeIOSScreenshots
       progress("#{e.message}，继续验证 Fastlane 截图")
     end
 
-    progress("单图验证 2/2 · 使用 Fastlane snapshot 拍听澜首页")
+    progress("单图验证 2/2 · 准备 Fastlane snapshot 首页用例")
     raw = File.join(work, "probe")
     capture_snapshot!(work, log, project, scheme, device, simulator, raw, probe: true)
     app_png = File.join(raw, "zh-Hans", "01-five-tones.png")
