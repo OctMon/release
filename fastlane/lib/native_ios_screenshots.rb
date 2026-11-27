@@ -175,19 +175,15 @@ module NativeIOSScreenshots
 
     id = simulator.fetch("udid")
     results = File.join(work, "#{key}.xcresult")
-    booted_here = false
+    booted_here = simulator.fetch("state") == "Shutdown"
+    duoctl = prepare_duo!(work, log, id, device.fetch(:size))
     xcode = xcode_options(work, project, scheme)
     logged!(log, "构建 Duo 模拟器测试", "xcodebuild", "build-for-testing", *xcode,
             "-destination", "platform=iOS Simulator,id=#{id}", timeout: 600)
-    if simulator.fetch("state") == "Shutdown"
-      logged!(log, "启动 #{key}", "xcrun", "simctl", "boot", id)
-      booted_here = true
-    end
-    logged!(log, "等待 #{key} 启动", "xcrun", "simctl", "bootstatus", id, timeout: 180)
     test_command = ["xcodebuild", "test-without-building", *xcode,
                     "-destination", "platform=iOS Simulator,id=#{id}", "-parallel-testing-enabled", "NO",
                     "-only-testing:TinglanUITests/PadUITests/#{device.fetch(:test)}", "-resultBundlePath", results]
-    capture_duo!(work, log, id, raw, device.fetch(:size), test_command)
+    capture_duo!(work, log, duoctl, raw, device.fetch(:size), test_command)
     progress("duo 三语素材就绪（#{LANGUAGES.size * RAW_PAGES.size} 张）")
   ensure
     cleanup_simulator(log, "关闭 #{key}", "shutdown", id) if booted_here
@@ -221,7 +217,9 @@ module NativeIOSScreenshots
     import_snapshot!(output, raw, name, device.fetch(:size), languages: languages, pages: pages)
   end
 
-  def capture_duo!(work, log, id, raw, size, test_command)
+  def prepare_duo!(work, log, id, size)
+    progress("Runner 镜像 #{ENV.fetch('ImageOS', '未报告')} / #{ENV.fetch('ImageVersion', '未报告')}")
+    logged!(log, "Duo 预检 · 启动并等待系统就绪", "xcrun", "simctl", "bootstatus", id, "-b", timeout: 180)
     source = File.join(work, "duoctl")
     logged!(log, "准备 duoctl 源码目录", "git", "init", "--quiet", source)
     logged!(log, "下载固定版本 duoctl", "git", "-C", source, "fetch", "--quiet", "--depth", "1",
@@ -230,8 +228,25 @@ module NativeIOSScreenshots
     duoctl = [File.join(source, "bin", "duoctl"), "-d", id]
     logged!(log, "展开 Duo 内屏", *duoctl, "open")
     logged!(log, "旋转 Duo 内屏至竖屏", *duoctl, "rotate", "portrait")
-    progress("Duo 内屏已展开并切换至竖屏")
+    probe = File.join(work, "duo-display-probe.png")
+    logged!(log, "Duo 预检 · 截取活动内屏", *duoctl, "screenshot", probe, timeout: 30)
+    validate_raw_png!(probe, size, "Duo 内屏预检")
+    progress("Duo 内屏预检通过（#{size.join(' × ')}）")
+    duoctl
+  rescue Release::Error
+    collect_duo_boot_log(log)
+    raise
+  end
 
+  def collect_duo_boot_log(log)
+    logged!(log, "收集 Duo 模拟器系统日志", "/usr/bin/log", "show", "--last", "8m", "--style", "compact",
+            "--predicate", 'process == "CoreSimulatorService" OR process == "simdiskimaged" OR process BEGINSWITH "SimLaunchHost"',
+            timeout: 15)
+  rescue Release::Error => e
+    progress(e.message)
+  end
+
+  def capture_duo!(work, log, duoctl, raw, size, test_command)
     bridge = File.join(work, "duo-requests")
     FileUtils.mkdir(bridge)
     logged!(log, "采集 duo", { "TEST_RUNNER_TINGLAN_DUO_REQUEST_DIR" => bridge }, *test_command, timeout: 480) do
