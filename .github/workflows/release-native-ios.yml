@@ -12,15 +12,23 @@ on:
         description: '源码分支，留空使用项目默认分支'
         type: string
         required: false
+      build_and_upload:
+        description: '打包并上传 TestFlight'
+        type: boolean
+        default: true
+      generate_screenshots:
+        description: '生成 App Store 商店截图'
+        type: boolean
+        default: false
       testflight_external_group:
         description: 'TestFlight 外部测试组名称或 ID'
         type: string
-        required: true
+        required: false
         default: '外部'
       testflight_changelog:
         description: 'TestFlight 外测说明'
         type: string
-        required: true
+        required: false
 
 permissions:
   contents: read
@@ -30,14 +38,44 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Pin native app source
+    runs-on: xcode-27
+    timeout-minutes: 10
+    outputs:
+      source_branch: ${{ steps.source.outputs.source_branch }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+
+      - name: Validate selection and pin source
+        id: source
+        run: ruby -r ./fastlane/lib/native_ios_release -e 'NativeIOSRelease.prepare!'
+        env:
+          NATIVE_PROJECT: ${{ inputs.project }}
+          NATIVE_BRANCH: ${{ inputs.branch }}
+          NATIVE_RUN_RELEASE: ${{ inputs.build_and_upload }}
+          NATIVE_RUN_SCREENSHOTS: ${{ inputs.generate_screenshots }}
+          TARGET_REPO: ${{ secrets[format('{0}_IOS_REPO', inputs.project)] }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
   release:
     name: Build and distribute iOS
+    needs: prepare
+    if: ${{ inputs.build_and_upload }}
     runs-on: xcode-27
     timeout-minutes: 75
     env:
       DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
       NATIVE_PROJECT: ${{ inputs.project }}
-      NATIVE_BRANCH: ${{ inputs.branch }}
+      NATIVE_SOURCE_BRANCH: ${{ needs.prepare.outputs.source_branch }}
+      NATIVE_SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
       NATIVE_CHANGELOG: ${{ inputs.testflight_changelog }}
       TESTFLIGHT_EXTERNAL_GROUP: ${{ inputs.testflight_external_group }}
       FASTLANE_SKIP_UPDATE_CHECK: '1'
@@ -64,7 +102,12 @@ jobs:
           bundler-cache: true
 
       - name: Checkout native app source
-        run: bundle exec ruby -r ./fastlane/lib/native_ios_release -e 'NativeIOSRelease.checkout!'
+        run: |
+          bundle exec ruby -r ./fastlane/lib/native_ios_release -e '
+            NativeIOSRelease.changelog
+            NativeIOSRelease.required("TESTFLIGHT_EXTERNAL_GROUP")
+            NativeIOSRelease.checkout!
+          '
         env:
           TARGET_REPO: ${{ secrets[format('{0}_IOS_REPO', inputs.project)] }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
@@ -76,16 +119,9 @@ jobs:
           MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
           SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
 
-      - name: Save IPA and dSYM
+      - name: Save IPA and dSYM on the runner
         id: artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ steps.archive.outputs.artifact_name }}
-          path: |
-            ${{ runner.temp }}/native-ios-output/*.ipa
-            ${{ runner.temp }}/native-ios-output/*.dSYM.zip
-          if-no-files-found: error
-          retention-days: 14
+        run: bundle exec ruby -r ./fastlane/lib/native_ios_release -e 'NativeIOSRelease.save_release_artifacts!'
 
       - name: Write build number back to the source branch
         id: writeback
@@ -108,7 +144,6 @@ jobs:
         env:
           IPA_STATUS: ${{ steps.archive.outcome }}
           ARTIFACT_STATUS: ${{ steps.artifact.outcome }}
-          ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
           VERSION_STATUS: ${{ steps.writeback.outcome }}
           UPLOAD_STATUS: ${{ steps.upload.outcome }}
           DISTRIBUTION_STATUS: ${{ steps.distribute.outputs.status || steps.distribute.outcome }}
@@ -124,5 +159,64 @@ jobs:
             fi
             printf -- '- 签名打包：%s\n- IPA 产物：%s\n- 源码构建号回写：%s\n- TestFlight 上传及处理：%s\n- 外部测试：%s\n' \
               "$IPA_STATUS" "$ARTIFACT_STATUS" "$VERSION_STATUS" "$UPLOAD_STATUS" "$DISTRIBUTION_STATUS"
-            if [[ -n "$ARTIFACT_URL" ]]; then printf '\n[下载 IPA 和 dSYM](%s)\n' "$ARTIFACT_URL"; fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  screenshots:
+    name: Generate App Store screenshots
+    needs: prepare
+    if: ${{ inputs.generate_screenshots }}
+    runs-on: [xcode-27, native-ios-screenshots]
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+      NATIVE_PROJECT: ${{ inputs.project }}
+      NATIVE_SOURCE_BRANCH: ${{ needs.prepare.outputs.source_branch }}
+      NATIVE_SOURCE_SHA: ${{ needs.prepare.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify Xcode 27.2 simulator SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcode_version="$(xcodebuild -version)"
+          test "${xcode_version%%$'\n'*}" = "Xcode 27.2" || { echo "Expected Xcode 27.2"; exit 1; }
+          test "$(xcrun --sdk iphonesimulator --show-sdk-version)" = "27.2"
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+
+      - name: Checkout pinned app source for screenshots
+        run: |
+          ruby -r ./fastlane/lib/native_ios_release -e 'NativeIOSRelease.checkout!(release: false)'
+        env:
+          TARGET_REPO: ${{ secrets[format('{0}_IOS_REPO', inputs.project)] }}
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Capture and save the private screenshot ZIP
+        run: ruby -r ./fastlane/lib/native_ios_release -e 'NativeIOSRelease.capture_store_screenshots!'
+        env:
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          NATIVE_SCREENSHOT_IPHONE_UDID: ${{ vars.NATIVE_SCREENSHOT_IPHONE_UDID }}
+          NATIVE_SCREENSHOT_IPAD_UDID: ${{ vars.NATIVE_SCREENSHOT_IPAD_UDID }}
+          NATIVE_SCREENSHOT_DUO_UDID: ${{ vars.NATIVE_SCREENSHOT_DUO_UDID }}
+
+  summary:
+    name: Summarize selected actions
+    if: ${{ always() }}
+    needs: [prepare, release, screenshots]
+    runs-on: xcode-27
+    timeout-minutes: 5
+    env:
+      PREPARE_STATUS: ${{ needs.prepare.result }}
+      RELEASE_STATUS: ${{ needs.release.result }}
+      SCREENSHOT_STATUS: ${{ needs.screenshots.result }}
+    steps:
+      - name: Report job outcomes
+        shell: bash
+        run: |
+          printf '### 原生 iOS 任务\n\n- 源码准备：%s\n- TestFlight 发布：%s\n- 商店截图：%s\n' \
+            "$PREPARE_STATUS" "$RELEASE_STATUS" "$SCREENSHOT_STATUS" >> "$GITHUB_STEP_SUMMARY"

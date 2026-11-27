@@ -240,7 +240,7 @@ platform :ios do
     UI.user_error!("没有生成 dSYM 压缩包") unless dsym && File.file?(dsym)
     result = { source_sha: source_sha, release_sha: release_sha, branch: branch, version: version,
                build_number: build_number, artifact_name: artifact_name }
-    File.write(NativeIOSRelease.metadata_path, JSON.generate(result.merge(ipa: ipa, identifier: identifier, testflight_group_id: group.id)))
+    File.write(NativeIOSRelease.metadata_path, JSON.generate(result.merge(ipa: ipa, dsym: dsym, identifier: identifier, testflight_group_id: group.id)))
     NativeIOSRelease.outputs(result)
   rescue LoadError, NativeIOSRelease::Error => e
     UI.user_error!(e.message)

@@ -168,9 +168,44 @@ module NativeIOSRelease
     with_git_ssh(repo, label: label) { |git_env| yield repo, git_env }
   end
 
-  def checkout!
-    changelog
+  def prepare!
+    unless [ENV["NATIVE_RUN_RELEASE"], ENV["NATIVE_RUN_SCREENSHOTS"]].include?("true")
+      raise Error, "请至少选择打包上传或生成商店截图"
+    end
+
     name = requested_branch
+    with_source_ssh do |repo, git_env|
+      if name.nil?
+        head = capture!("git", "ls-remote", "--symref", "--exit-code", repo, "HEAD", env: git_env,
+                        error: "无法解析源码仓库默认分支")
+        name, sha = default_branch_pin(head)
+      else
+        ref = "refs/heads/#{name}"
+        entry = capture!("git", "ls-remote", "--exit-code", "--refs", repo, ref, env: git_env,
+                         error: "无法解析所选源码分支")
+        sha = entry.lines.map(&:split).find { |_, candidate| candidate == ref }&.first
+      end
+      outputs(source_branch: name, source_sha: validate_sha!(sha))
+    end
+  end
+
+  def default_branch_pin(output)
+    lines = output.lines.map(&:split)
+    head = lines.find { |kind, ref, target| kind == "ref:" && ref&.start_with?("refs/heads/") && target == "HEAD" }
+    raise Error, "源码仓库未公开默认分支" unless head
+
+    [validate_branch!(head[1].delete_prefix("refs/heads/")), lines.find { |_, ref| ref == "HEAD" }&.first]
+  end
+
+  def validate_sha!(sha)
+    raise Error, "无效的源码提交 SHA" unless sha.to_s.match?(/\A[0-9a-f]{40}\z/)
+
+    sha
+  end
+
+  def checkout!(release: true)
+    pin = ENV.fetch("NATIVE_SOURCE_SHA", "").strip
+    name = pin.empty? ? requested_branch : validate_branch!(required("NATIVE_SOURCE_BRANCH"))
     branch_arguments = name ? ["--branch", name] : []
     with_source_ssh do |repo, git_env|
       capture!("git", "clone", "--single-branch", *branch_arguments, "--", repo, source_dir, env: git_env,
@@ -179,8 +214,64 @@ module NativeIOSRelease
     actual = source_branch
     raise Error, "检出的源码分支与输入不一致" if name && actual != name
 
+    unless pin.empty?
+      validate_sha!(pin)
+      git!("merge-base", "--is-ancestor", pin, "HEAD", error: "固定提交已不在源码分支历史中，请重新触发工作流")
+      git!("checkout", "-B", actual, pin, error: "无法检出固定源码提交")
+    end
     puts "源码 #{actual} @ #{git!('rev-parse', 'HEAD')}"
-    project
+    release ? project : screenshot_project
+  end
+
+  def screenshot_project
+    config = YAML.safe_load_file(File.join(source_dir, CONFIG_PATH))
+    unless config.is_a?(Hash) && %w[project scheme].all? { |key| config[key].is_a?(String) && !config[key].strip.empty? }
+      raise Error, "#{CONFIG_PATH} 须配置截图用的 project 和 scheme"
+    end
+    validate_project_path!(source_dir, config.fetch("project"))
+    config.slice("project", "scheme")
+  rescue Errno::ENOENT, Psych::Exception
+    raise Error, "无法读取截图项目配置", cause: nil
+  end
+
+  def private_artifact_dir(kind, home: Dir.home, env: ENV)
+    identifiers = %w[GITHUB_RUN_ID GITHUB_RUN_ATTEMPT].map { |name| required(name, env: env) }
+    unless %w[release screenshots].include?(kind) && identifiers.all? { |id| id.match?(/\A[1-9][0-9]*\z/) }
+      raise Error, "无效的发布产物目录标识"
+    end
+    [".native-ios-artifacts", project_key(env: env), *identifiers, kind].reduce(home) do |parent, name|
+      directory = File.join(parent, name)
+      begin
+        Dir.mkdir(directory, 0o700)
+      rescue Errno::EEXIST
+        stat = File.lstat(directory)
+        unless stat.directory? && stat.uid == Process.uid && (stat.mode & 0o777) == 0o700
+          raise Error, "发布机的产物目录必须属于 Runner 账户、权限为 700，且不能是符号链接"
+        end
+      end
+      directory
+    end
+  end
+
+  def save_release_artifacts!
+    build = metadata
+    directory = private_artifact_dir("release")
+    Dir.mktmpdir(".release-", directory) do |staging|
+      %w[ipa dsym].each do |type|
+        source = build.fetch(type)
+        name = File.basename(source)
+        target = File.join(staging, name)
+        FileUtils.cp(source, target)
+        File.chmod(0o600, target)
+        File.rename(target, File.join(directory, name))
+      end
+    end
+    puts "IPA 和 dSYM 已保存至发布机受限目录"
+  end
+
+  def capture_store_screenshots!
+    require_relative "native_ios_screenshots"
+    NativeIOSScreenshots.run!
   end
 
   def build_settings(config)
