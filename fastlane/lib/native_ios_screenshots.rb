@@ -196,7 +196,7 @@ module NativeIOSScreenshots
         boot_simulator!(log, "Duo 预检 · 启动新建模拟器", id, timeout: 180)
       end
     rescue Release::Error
-      collect_duo_boot_log(log)
+      collect_simulator_log(log, "Duo")
       raise
     end
     duoctl = [executable, "-d", id]
@@ -233,25 +233,18 @@ module NativeIOSScreenshots
     logged!(log, stage, "xcrun", "simctl", "bootstatus", id, "-b", timeout: timeout, validate_output: validate)
   end
 
-  def capture_snapshot!(work, log, project, scheme, device, simulator, raw, probe: false)
+  def capture_snapshot!(work, log, project, scheme, device, simulator, raw, probe_packages: nil)
     key = device.fetch(:key)
     name = simulator.fetch("name")
     output = File.join(work, "snapshot-#{key}")
+    probe = !probe_packages.nil?
     languages = probe ? ["zh-Hans"] : LANGUAGES
     pages = probe ? ["01-five-tones"] : RAW_PAGES
     test = probe ? "testCaptureSnapshotHomeProbe" : device.fetch(:test)
     snapshot_options = []
     if probe
-      package_path = File.join(work, "source-packages")
-      xcode = xcode_options(work, project, scheme)
-      destination = "platform=iOS Simulator,id=#{simulator.fetch('udid')}"
-      logged!(log, "单图验证 · 解析 Swift Package 依赖", "xcodebuild", "-resolvePackageDependencies",
-              *xcode, "-destination", destination, "-clonedSourcePackagesDirPath", package_path, timeout: 600)
-      logged!(log, "单图验证 · 构建截图测试", "xcodebuild", "build-for-testing",
-              *xcode, "-destination", destination, "-clonedSourcePackagesDirPath", package_path,
-              "-disableAutomaticPackageResolution", timeout: 600)
       snapshot_options = ["--test_without_building", "--skip_package_dependencies_resolution",
-                          "--disable_package_automatic_updates", "--cloned_source_packages_path", package_path]
+                          "--disable_package_automatic_updates", "--cloned_source_packages_path", probe_packages]
     end
     env = {
       "BUNDLE_GEMFILE" => File.expand_path("../../Gemfile", __dir__),
@@ -294,12 +287,12 @@ module NativeIOSScreenshots
     validate_raw_png!(probe, size, "Duo 内屏预检")
     progress("Duo 内屏预检通过（#{size.join(' × ')}）")
   rescue Release::Error
-    collect_duo_boot_log(log)
+    collect_simulator_log(log, "Duo")
     raise
   end
 
-  def collect_duo_boot_log(log)
-    logged!(log, "收集 Duo 模拟器系统日志", "/usr/bin/log", "show", "--last", "8m", "--style", "compact",
+  def collect_simulator_log(log, device)
+    logged!(log, "收集 #{device} 模拟器系统日志", "/usr/bin/log", "show", "--last", "8m", "--style", "compact",
             "--predicate", 'process == "CoreSimulatorService" OR process == "simdiskimaged" OR process BEGINSWITH "SimLaunchHost"',
             timeout: 15)
   rescue Release::Error => e
@@ -421,38 +414,45 @@ module NativeIOSScreenshots
     progress("加密诊断日志打包失败")
   end
 
+  def build_snapshot_probe!(work, log, project, scheme, id)
+    packages = File.join(work, "source-packages")
+    options = [*xcode_options(work, project, scheme), "-destination", "platform=iOS Simulator,id=#{id}",
+               "-clonedSourcePackagesDirPath", packages]
+    logged!(log, "单图验证 · 解析 Swift Package 依赖", "xcodebuild", "-resolvePackageDependencies",
+            *options, timeout: 600)
+    logged!(log, "单图验证 · 构建截图测试", "xcodebuild", "build-for-testing",
+            *options, "-disableAutomaticPackageResolution", timeout: 600)
+    packages
+  end
+
   def capture_probe!(work, log, project, scheme, simulator, destination, password)
     device = DEVICES.first
     id = simulator.fetch("udid")
     progress("Runner 镜像 #{ENV.fetch('ImageOS', '未报告')} / #{ENV.fetch('ImageVersion', '未报告')}")
     logged!(log, "读取模拟器运行时", "xcrun", "simctl", "list", "runtimes")
-    boot_simulator!(log, "单图验证 1/2 · 启动 iPhone 模拟器", id, timeout: 240)
     system_png = File.join(work, "simulator-home.png")
-    system_error = nil
     begin
-      logged!(log, "单图验证 1/2 · 截取模拟器屏幕", "xcrun", "simctl", "io", id, "screenshot", system_png, timeout: 30)
+      boot_simulator!(log, "单图验证 1/2 · 启动 iPhone 模拟器", id, timeout: 240)
+      logged!(log, "单图验证 1/2 · 截取模拟器屏幕", "xcrun", "simctl", "io", id, "screenshot",
+              system_png, timeout: 30)
       validate_raw_png!(system_png, device.fetch(:size), "模拟器屏幕")
-    rescue Release::Error => e
-      system_error = e
+    rescue Release::Error
       FileUtils.rm_f(system_png)
-      File.open(log, "a", 0o600) { |stream| stream.puts(e.message) }
-      progress("#{e.message}，继续验证 Fastlane 截图")
+      collect_simulator_log(log, "iPhone")
+      raise
     end
 
     progress("单图验证 2/2 · 准备 Fastlane snapshot 首页用例")
+    packages = build_snapshot_probe!(work, log, project, scheme, id)
     raw = File.join(work, "probe")
-    capture_snapshot!(work, log, project, scheme, device, simulator, raw, probe: true)
+    capture_snapshot!(work, log, project, scheme, device, simulator, raw, probe_packages: packages)
     app_png = File.join(raw, "zh-Hans", "01-five-tones.png")
     zip = File.join(work, "screenshot-probe.zip")
-    images = system_error ? [app_png] : [system_png, app_png]
-    Release.encrypt_zip!(zip, password, *images)
+    Release.encrypt_zip!(zip, password, system_png, app_png)
     File.chmod(0o600, zip)
     output = File.join(destination, File.basename(zip))
     File.rename(zip, output)
     Release.outputs(zip_path: output, artifact_name: "screenshot-probe")
-    if system_error
-      raise Release::Error, "系统截图失败，Fastlane 单图通过，已打包听澜首页。#{system_error.message}"
-    end
     progress("单图验证通过，已打包两张加密验证图")
   end
 
